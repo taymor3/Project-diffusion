@@ -1,0 +1,9 @@
+copy all of the repo into your local vm.
+download all the environment package in the nuplan devkit.
+download minisplit and maps from nuplan database
+store them in the bashrc
+export NUPLAN_DATA_ROOT=$HOME/data1/nuplan-v1.1/splits/mini
+export NUPLAN_MAPS_ROOT=$HOME/data1/maps
+after that update the o1_toy_data.ipynb
+to make the places of the database right
+after that run the cell in the jupyter you should see the whole senarios of the database.
