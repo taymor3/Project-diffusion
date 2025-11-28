@@ -324,7 +324,6 @@ class DiffusionPlanner(AbstractPlanner):
         all_traj = []
 
         for i in range(num_of_parents):
-            print("parent step:", i)
             _, outputs = self._planner(inputs)
 
             trajectory = InterpolatedTrajectory(
@@ -333,15 +332,14 @@ class DiffusionPlanner(AbstractPlanner):
             mo = self.MidOutput(trajectory, outputs)
             all_traj.append(mo)
             
-            # still requiers work
             rolled_inputs = self.roll_ego_history_with_predictions(
                         original_inputs=inputs,
                         parent_outputs=outputs,
                         ego_state_history=current_input.history.ego_states,
                         num_new_ticks=5,
                     )
+            rolled_inputs = self.observation_normalizer(rolled_inputs)
             for j in range(num_of_branches):
-                print("    branching step:", j)
                 _, branch_outputs = self._planner(rolled_inputs)
 
                 branch_trajectory = InterpolatedTrajectory(
