@@ -71,7 +71,7 @@ class SimulationRunner(AbstractRunner):
         """
         return self.simulation.scenario
 
-    def run(self) -> RunnerReport:
+    def run(self) -> RunnerReport: # here we run the simulation
         """
         Run through all simulations. The steps of execution follow:
          - Initialize all planners

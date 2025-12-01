@@ -27,7 +27,7 @@ class StepSimulationTimeController(AbstractSimulationTimeController):
         """Inherited, see superclass."""
         scenario_time = self.scenario.get_time_point(self.current_iteration_index)
         return SimulationIteration(time_point=scenario_time, index=self.current_iteration_index)
-
+# here we get the next iteration
     def next_iteration(self) -> Optional[SimulationIteration]:
         """Inherited, see superclass."""
         self.current_iteration_index += 1
