@@ -492,7 +492,7 @@ class DiffusionPlanner(AbstractPlanner):
         inputs = self.planner_input_to_model_inputs(current_input)
 
         norm_inputs = self.observation_normalizer(inputs)
-        num_of_parents = 2
+        num_of_parents = 1
         num_of_branches = 2
 
         parent_noise_std = 0
