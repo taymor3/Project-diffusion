@@ -205,17 +205,134 @@ class DiffusionPlanner(AbstractPlanner):
                     print(f"    dim {d}: mean={mean:.4f}, std={std:.4f}, "
                         f"min={vmin:.4f}, max={vmax:.4f}")
             
-
-
-
-    def get_best_trajectory(self, trajectories: List[MidOutput]) -> AbstractTrajectory:
+    def score_branch(self, branch_traj: AbstractTrajectory, branch_outputs: Dict[str, torch.Tensor]) -> float:
         """
-        Select the best trajectory based on a simple heuristic (e.g., minimum distance to a reference path).
-        This is a placeholder for more sophisticated selection logic.
-        """
-        # Placeholder: return the first trajectory
+        Heuristic score for a branch trajectory.
+        Lower score is better.
 
-        return trajectories[1].branch_trajectories[0]
+        Components:
+        - progress: how far ego moves along the path (more is better)
+        - smoothness: sum of absolute heading changes (less is better)
+        - collision_penalty: large penalty if predicted ego-neighbor distance gets too small
+        """
+
+        # Get list of states along the trajectory
+        try:
+            states = branch_traj.get_sampled_trajectory()
+        except AttributeError:
+            states = getattr(branch_traj, "_trajectory", [])
+
+        if not states or len(states) < 2:
+            # Very bad score if we don't have a meaningful trajectory
+            print("[DEBUG][score_branch] too few states in branch trajectory")  # TODO-s: remove
+            return 1e9
+
+        # --- Progress component ---
+        start = states[0].rear_axle
+        end = states[-1].rear_axle
+
+        dx = float(end.x - start.x)
+        dy = float(end.y - start.y)
+        progress = math.sqrt(dx * dx + dy * dy)
+
+        # --- Smoothness component (heading changes) ---
+        headings = [float(s.rear_axle.heading) for s in states]
+        heading_changes = []
+        for h0, h1 in zip(headings[:-1], headings[1:]):
+            # Wrap difference to [-pi, pi] to avoid jumps
+            dh = (h1 - h0 + math.pi) % (2.0 * math.pi) - math.pi
+            heading_changes.append(abs(dh))
+        smoothness_penalty = sum(heading_changes)
+
+        # --- Collision component (predicted ego vs neighbors) ---
+        collision_penalty = 0.0
+        pred = branch_outputs.get("prediction", None)
+        try:
+            if pred is not None:
+                # pred: [B, A, T, 4], we assume B=1 here
+                pred_np = pred.detach().cpu().numpy()
+                if pred_np.shape[0] > 0 and pred_np.shape[1] > 1:
+                    # ego positions and neighbor positions in the model's frame
+                    ego_xy = pred_np[0, 0, :, :2]              # [T, 2]
+                    neighbors_xy = pred_np[0, 1:, :, :2]       # [N, T, 2]
+
+                    if neighbors_xy.size > 0:
+                        # Compute distances: [N, T]
+                        diff = neighbors_xy - ego_xy[None, :, :]   # broadcast over neighbors
+                        dist = np.linalg.norm(diff, axis=-1)
+                        min_dist = float(dist.min())
+
+                        # Simple piecewise penalty
+                        if min_dist < 1.0:
+                            collision_penalty = 100.0
+                        elif min_dist < 2.0:
+                            collision_penalty = (2.0 - min_dist) * 20.0
+                        else:
+                            collision_penalty = 0.0
+        except Exception as e:
+            print(f"[DEBUG][score_branch] collision term error: {e}")  # TODO-s: remove
+
+        # We want:
+        # - more progress -> better (lower score)
+        # - less heading change -> better (lower score)
+        # - fewer close contacts -> better (lower score)
+        #
+        # Simple linear combination:
+        w_progress  = -1.0     # negative: more progress reduces score
+        w_smooth    =  0.5     # positive: more heading change increases score
+        w_collision =  1.0     # collision_penalty already scaled large
+
+        score = (
+            w_progress  * progress +
+            w_smooth    * smoothness_penalty +
+            w_collision * collision_penalty
+        )
+
+        # Debug print
+        print(
+            f"[DEBUG][score_branch] progress={progress:.2f}, "
+            f"smooth_pen={smoothness_penalty:.2f}, "
+            f"coll_pen={collision_penalty:.2f}, score={score:.2f}"
+        )  # TODO-s: remove
+
+        return score
+
+
+    def get_best_trajectory(self, trajectories: List["DiffusionPlanner.MidOutput"]) -> AbstractTrajectory:
+        """
+        Select the best parent based on the best-scoring branch (leaf) across all parents.
+
+        We scan all branches, find the leaf with minimal score, and then
+        return the parent trajectory of that leaf.
+        """
+        best_score = None
+        best_parent_traj = None
+
+        for parent_idx, mo in enumerate(trajectories):
+            for branch_idx, (branch_traj, branch_outputs) in enumerate(
+                zip(mo.branch_trajectories, mo.branch_outputs)
+            ):
+                score = self.score_branch(branch_traj, branch_outputs)
+
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_parent_traj = mo.parent_trajectory
+
+                    print(
+                        f"[DEBUG][get_best_trajectory] new best "
+                        f"parent={parent_idx}, branch={branch_idx}, score={best_score:.2f}"
+                    )  # TODO-s: remove
+
+        if best_parent_traj is None:
+            # Fallback: return first parent trajectory
+            print("[DEBUG][get_best_trajectory] fallback to first parent trajectory")  # TODO-s: remove
+            return trajectories[0].parent_trajectory
+
+        print(f"[DEBUG][get_best_trajectory] final best score={best_score:.2f}")  # TODO-s: remove
+
+        return best_parent_traj
+
+
     
     # function to add noise to inputs
     def _add_noise_to_inputs(
@@ -487,57 +604,63 @@ class DiffusionPlanner(AbstractPlanner):
         
     def compute_planner_trajectory(self, current_input: PlannerInput) -> AbstractTrajectory:
         """
-        Inherited.
+        v0.5:
+        - Multiple parents (roots): different noisy samples from the same observation.
+        - For each parent: build branches by rolling inputs + noise.
+        - Score leaves and select the parent of the best leaf.
         """
-        inputs = self.planner_input_to_model_inputs(current_input)
+        # RAW inputs from DataProcessor
+        inputs_raw = self.planner_input_to_model_inputs(current_input)
 
-        norm_inputs = self.observation_normalizer(inputs)
-        num_of_parents = 1
+        # Normalized inputs for the parent pass (original behavior)
+        norm_inputs = self.observation_normalizer(inputs_raw)
+
+        # Tree shape
+        num_of_parents = 3
         num_of_branches = 2
 
-        parent_noise_std = 0
+        # Noise levels
+        parent_noise_std = 0.005  # small; parent 0 will effectively be near-original
+        branch_noise_std = 0.005  # same scale for branches
 
-        all_traj = []
-        #self.debug_print_model_inputs(inputs, current_input.history.ego_states)
+        all_traj: List[DiffusionPlanner.MidOutput] = []
 
-        for i in range(num_of_parents):
-            noisy_parent_inputs = self._add_noise_to_inputs(norm_inputs, std=parent_noise_std)
+        for parent_idx in range(num_of_parents):
+            # For parent 0 you can optionally reduce noise for a "baseline-like" parent
+            if parent_idx == 0:
+                cur_parent_noise = 0.0
+            else:
+                cur_parent_noise = parent_noise_std
 
-            _, outputs = self._planner(noisy_parent_inputs)
+            # Parent prediction: same observation, different noise per parent
+            noisy_parent_inputs = self._add_noise_to_inputs(norm_inputs, std=cur_parent_noise)
+            _, parent_outputs = self._planner(noisy_parent_inputs)
 
-            trajectory = InterpolatedTrajectory(
-                    trajectory=self.outputs_to_trajectory(outputs, current_input.history.ego_states)
-                )
-            mo = self.MidOutput(trajectory, outputs)
+            parent_traj = InterpolatedTrajectory(
+                trajectory=self.outputs_to_trajectory(parent_outputs, current_input.history.ego_states)
+            )
+            mo = self.MidOutput(parent_traj, parent_outputs)
             all_traj.append(mo)
 
-            #self.debug_print_planner_outputs(outputs,ego_state_history=current_input.history.ego_states)
-
-            rolled_inputs = self.roll_inputs_with_predictions_multi_agent(
-                original_inputs=norm_inputs,
-                parent_outputs=outputs,
+            # Build rolled RAW inputs using this parent's outputs
+            rolled_inputs_raw = self.roll_inputs_with_predictions_multi_agent(
+                original_inputs=inputs_raw,
+                parent_outputs=parent_outputs,
                 num_new_ticks=1,
-                k_neighbors=5, 
+                k_neighbors=5,
             )
-            #print("========== Parent Output ==========")
-            #self.debug_print_planner_outputs(outputs,ego_state_history=current_input.history.ego_states)
-            
-            #self.debug_check_roll_multi_agent(original_inputs=norm_inputs,rolled_inputs=rolled_inputs,parent_outputs=outputs,k_neighbors=5)
+            # Normalize rolled inputs before branch passes
+            rolled_inputs = self.observation_normalizer(rolled_inputs_raw)
 
-            #rolled_inputs = self.observation_normalizer(rolled_inputs)
-            branch_noise_std = 0
-
-            for j in range(num_of_branches):
+            # Branch predictions for this parent
+            for branch_idx in range(num_of_branches):
                 noisy_branch_inputs = self._add_noise_to_inputs(rolled_inputs, std=branch_noise_std)
-
                 _, branch_outputs = self._planner(noisy_branch_inputs)
 
-                branch_trajectory = InterpolatedTrajectory(
-                        trajectory=self.outputs_to_trajectory(branch_outputs, current_input.history.ego_states)
-                    )
-                mo.add_branch(branch_trajectory, branch_outputs)
-                #print("========== Branch Output ==========")
-                #self.debug_print_planner_outputs(branch_outputs,ego_state_history=current_input.history.ego_states)
+                branch_traj = InterpolatedTrajectory(
+                    trajectory=self.outputs_to_trajectory(branch_outputs, current_input.history.ego_states)
+                )
+                mo.add_branch(branch_traj, branch_outputs)
 
-
-        return self.get_best_trajectory(all_traj)  
+        # Choose parent based on best leaf (branch)
+        return self.get_best_trajectory(all_traj)
