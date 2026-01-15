@@ -300,13 +300,16 @@ class DiffusionPlanner(AbstractPlanner):
 
     def get_best_trajectory(self, trajectories: List["DiffusionPlanner.MidOutput"]) -> AbstractTrajectory:
         """
-        Select the best parent based on the best-scoring branch (leaf) across all parents.
-
-        We scan all branches, find the leaf with minimal score, and then
-        return the parent trajectory of that leaf.
+        v0.7 selection:
+        - Score all branches (as in v0.6).
+        - Strong bias toward parent 0 (the v0-like parent):
+          only switch to another parent if its best branch score
+          is better than parent 0's best branch by more than a margin.
         """
-        best_score = None
-        best_parent_traj = None
+        global_best_score = None
+        global_best_parent_traj = None
+
+        parent0_best_score = None
 
         for parent_idx, mo in enumerate(trajectories):
             for branch_idx, (branch_traj, branch_outputs) in enumerate(
@@ -314,23 +317,40 @@ class DiffusionPlanner(AbstractPlanner):
             ):
                 score = self.score_branch(branch_traj, branch_outputs)
 
-                if best_score is None or score < best_score:
-                    best_score = score
-                    best_parent_traj = mo.parent_trajectory
+                # Track best score for parent 0 separately
+                if parent_idx == 0:
+                    if parent0_best_score is None or score < parent0_best_score:
+                        parent0_best_score = score
 
-                    print(
-                        f"[DEBUG][get_best_trajectory] new best "
-                        f"parent={parent_idx}, branch={branch_idx}, score={best_score:.2f}"
-                    )  # TODO-s: remove
+                # Track global best over all parents
+                if global_best_score is None or score < global_best_score:
+                    global_best_score = score
+                    global_best_parent_traj = mo.parent_trajectory
 
-        if best_parent_traj is None:
-            # Fallback: return first parent trajectory
-            print("[DEBUG][get_best_trajectory] fallback to first parent trajectory")  # TODO-s: remove
+        # Fallback: if anything went wrong, default to parent 0
+        if global_best_parent_traj is None or parent0_best_score is None:
+            print("[DEBUG][get_best_trajectory] fallback to parent 0")
             return trajectories[0].parent_trajectory
 
-        print(f"[DEBUG][get_best_trajectory] final best score={best_score:.2f}")  # TODO-s: remove
+        # Margin in score units (lower is better). With scores typically in [-55, -82],
+        # a margin of 4 means we only override parent 0 when another parent is
+        # clearly better (by > 4 points).
+        MARGIN = 3.0
 
-        return best_parent_traj
+        print(
+            f"[DEBUG][get_best_trajectory] parent0_best={parent0_best_score:.2f}, "
+            f"global_best={global_best_score:.2f}, margin={MARGIN:.2f}"
+        )
+
+        # Only switch away from parent 0 if the global best is significantly better.
+        # Remember: lower score is better.
+        if global_best_score + MARGIN < parent0_best_score:
+            print("[DEBUG][get_best_trajectory] selecting non-parent0 trajectory")
+            return global_best_parent_traj
+        else:
+            print("[DEBUG][get_best_trajectory] keeping parent0 trajectory")
+            return trajectories[0].parent_trajectory
+
 
 
     
@@ -620,8 +640,8 @@ class DiffusionPlanner(AbstractPlanner):
         num_of_branches = 2
 
         # Noise levels
-        parent_noise_std = 0.005  # small; parent 0 will effectively be near-original
-        branch_noise_std = 0.005  # same scale for branches
+        parent_noise_std = 0.02  # small; parent 0 will effectively be near-original
+        branch_noise_std = 0.02  # same scale for branches
 
         all_traj: List[DiffusionPlanner.MidOutput] = []
 
