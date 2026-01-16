@@ -335,7 +335,7 @@ class DiffusionPlanner(AbstractPlanner):
         # Margin in score units (lower is better). With scores typically in [-55, -82],
         # a margin of 4 means we only override parent 0 when another parent is
         # clearly better (by > 4 points).
-        MARGIN = 3.0
+        MARGIN = 4.0
 
         print(
             f"[DEBUG][get_best_trajectory] parent0_best={parent0_best_score:.2f}, "
