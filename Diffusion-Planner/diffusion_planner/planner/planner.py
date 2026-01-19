@@ -61,6 +61,20 @@ class DiffusionPlanner(AbstractPlanner):
         
         self.observation_normalizer = config.observation_normalizer
 
+        # --- selection stats (ticks) ---
+        self._sel_total = 0
+        self._sel_parent0 = 0
+        self._sel_non_parent0 = 0
+
+        # keep global across scenarios (planner instance persists)
+        self._sel_total_all = 0
+        self._sel_parent0_all = 0
+        self._sel_non_parent0_all = 0
+
+        # Print every N ticks (set to e.g. 200 to get ~1 line per scenario)
+        self._sel_print_every = 50
+
+
     def name(self) -> str:
         """
         Inherited.
@@ -77,6 +91,12 @@ class DiffusionPlanner(AbstractPlanner):
         """
         Inherited.
         """
+        # If the same planner instance is reused across scenarios, this prints per-scenario stats.
+        if hasattr(self, "_sel_initialized_once") and self._sel_initialized_once:
+            self._sel_log("scenario_end")
+        self._sel_reset()
+        self._sel_initialized_once = True
+
         self._map_api = initialization.map_api
         self._route_roadblock_ids = initialization.route_roadblock_ids
 
@@ -135,6 +155,19 @@ class DiffusionPlanner(AbstractPlanner):
         def add_branch(self, branch_trajectory: AbstractTrajectory, branch_output: Dict[str, torch.Tensor]):
             self.branch_trajectories.append(branch_trajectory)
             self.branch_outputs.append(branch_output)
+
+    def _sel_reset(self) -> None:
+        self._sel_total = 0
+        self._sel_parent0 = 0
+        self._sel_non_parent0 = 0
+
+    def _sel_log(self, tag: str) -> None:
+        print(
+            f"[STATS][{tag}] ticks={self._sel_total} parent0={self._sel_parent0} "
+            f"non_parent0={self._sel_non_parent0} | "
+            f"ALL ticks={self._sel_total_all} parent0={self._sel_parent0_all} "
+            f"non_parent0={self._sel_non_parent0_all}"
+        )
 
 
     def debug_print_model_inputs(self,model_inputs: dict, ego_state_history) -> None:
@@ -342,14 +375,29 @@ class DiffusionPlanner(AbstractPlanner):
             f"global_best={global_best_score:.2f}, margin={MARGIN:.2f}"
         )
 
-        # Only switch away from parent 0 if the global best is significantly better.
-        # Remember: lower score is better.
-        if global_best_score + MARGIN < parent0_best_score:
+        selected_non_parent0 = (global_best_score + MARGIN < parent0_best_score)
+
+        # Update counters (one tick = one planner call)
+        self._sel_total += 1
+        self._sel_total_all += 1
+        if selected_non_parent0:
+            self._sel_non_parent0 += 1
+            self._sel_non_parent0_all += 1
+        else:
+            self._sel_parent0 += 1
+            self._sel_parent0_all += 1
+            
+        # periodic logging
+        if self._sel_print_every and (self._sel_total % self._sel_print_every == 0):
+            self._sel_log("running")
+
+        if selected_non_parent0:
             print("[DEBUG][get_best_trajectory] selecting non-parent0 trajectory")
             return global_best_parent_traj
         else:
             print("[DEBUG][get_best_trajectory] keeping parent0 trajectory")
             return trajectories[0].parent_trajectory
+
 
 
 
@@ -547,10 +595,10 @@ class DiffusionPlanner(AbstractPlanner):
                 # but for now we leave them unchanged.
 
                 new_hist[-1] = row
-                if n_idx == 0:
-                    # sanity check for first neighbor: last row vs pred_t1
-                    diff = (new_hist[-1, :4] - pred_t1).abs()
-                    print("[sanity] neighbor 0 last row vs pred_t1 diff:", diff.tolist())
+                # if n_idx == 0:
+                    # # sanity check for first neighbor: last row vs pred_t1
+                    # diff = (new_hist[-1, :4] - pred_t1).abs()
+                    # print("[sanity] neighbor 0 last row vs pred_t1 diff:", diff.tolist())
             else:
                 # For neighbors without explicit prediction, we simply repeat
                 # their last known state in the final slot.
