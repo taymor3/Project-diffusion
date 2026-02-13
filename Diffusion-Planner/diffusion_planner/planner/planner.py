@@ -72,7 +72,18 @@ class DiffusionPlanner(AbstractPlanner):
         self._sel_non_parent0_all = 0
 
         # Print every N ticks (set to e.g. 200 to get ~1 line per scenario)
-        self._sel_print_every = 50
+        self._sel_print_every = 49
+        # Perf/debug switches
+        self._debug_verbose = False  # set True only when debugging (very expensive if True)
+
+        # Run expensive batching asserts only once per batch size (e.g., 2 and 3)
+        self._checked_batch_sizes = set()
+        self._batch_check_this_call = False
+
+        # Lightweight batch sanity checks (only once per batch size; negligible overhead)
+        self._checked_batch_sanity = set()
+        self._batch_sanity_keys = ("ego_agent_past", "neighbor_agents_past")
+
 
 
     def name(self) -> str:
@@ -91,12 +102,6 @@ class DiffusionPlanner(AbstractPlanner):
         """
         Inherited.
         """
-        # If the same planner instance is reused across scenarios, this prints per-scenario stats.
-        if hasattr(self, "_sel_initialized_once") and self._sel_initialized_once:
-            self._sel_log("scenario_end")
-        self._sel_reset()
-        self._sel_initialized_once = True
-
         self._map_api = initialization.map_api
         self._route_roadblock_ids = initialization.route_roadblock_ids
 
@@ -156,10 +161,12 @@ class DiffusionPlanner(AbstractPlanner):
             self.branch_trajectories.append(branch_trajectory)
             self.branch_outputs.append(branch_output)
 
+
     def _sel_reset(self) -> None:
         self._sel_total = 0
         self._sel_parent0 = 0
         self._sel_non_parent0 = 0
+
 
     def _sel_log(self, tag: str) -> None:
         print(
@@ -169,74 +176,6 @@ class DiffusionPlanner(AbstractPlanner):
             f"non_parent0={self._sel_non_parent0_all}"
         )
 
-
-    def debug_print_model_inputs(self,model_inputs: dict, ego_state_history) -> None:
-        print("\n========== [PlannerInput Debug] ==========")
-
-        # ----- Ego history from nuPlan buffer -----
-        history_list = list(ego_state_history)
-        print(f"# ego_states in history buffer: {len(history_list)}")
-        if history_list:
-            last = history_list[-1]
-            print(
-                "last ego state (world): "
-                f"x={last.rear_axle.x:.3f}, "
-                f"y={last.rear_axle.y:.3f}, "
-                f"yaw={float(last.rear_axle.heading):.3f}, "
-                f"speed={float(last.dynamic_car_state.speed):.3f}"
-            )
-
-        print("\n=== [Model Inputs Dict] ===")
-        for name, v in model_inputs.items():
-            if not isinstance(v, torch.Tensor):
-                print(f"{name}: non-tensor (type={type(v)})")
-                continue
-
-            shape = tuple(v.shape)
-            print(f"{name}: shape={shape}, dtype={v.dtype}, device={v.device}")
-
-            # Generic stats for float tensors
-            if v.dtype.is_floating_point:
-                flat = v.detach().cpu().view(-1)
-                mean = flat.mean().item()
-                std = flat.std().item()
-                vmin = flat.min().item()
-                vmax = flat.max().item()
-                print(f"  stats: mean={mean:.4f}, std={std:.4f}, min={vmin:.4f}, max={vmax:.4f}")
-
-            # Special cases we care about
-
-            if name == "ego_current_state":
-                # ego_current_state is [1, D] or [B, D]
-                ecs = v[0].detach().cpu()
-                print("  ego_current_state[0]:")
-                for i, val in enumerate(ecs):
-                    print(f"    dim {i}: {val:.4f}")
-                # heuristic: show norm of [cos, sin] if dims 2,3 exist
-                if ecs.shape[0] >= 4:
-                    cs_norm = (ecs[2]**2 + ecs[3]**2).sqrt().item()
-                    print(f"    -> orientation norm (dim2,3): {cs_norm:.4f}")
-
-            if name == "neighbor_agents_past" and v.ndim == 4:
-                B, N, H, D = v.shape
-                print(f"  neighbor_agents_past: B={B}, N={N}, H={H}, D={D}")
-                # Show one example agent over time
-                sample = v[0, 0]  # [H, D]
-                print("  sample neighbor 0 history (first 3 timesteps, first 8 dims):")
-                for t in range(min(3, H)):
-                    row = sample[t, :8].detach().cpu().tolist()
-                    print(f"    t={t}: {['%.4f' % x for x in row]}")
-
-                # Per-feature stats like you already printed
-                print("  --- per-feature stats over all (B,N,H) ---")
-                for d in range(D):
-                    vals = v[..., d].detach().cpu().view(-1)
-                    mean = vals.mean().item()
-                    std = vals.std().item()
-                    vmin = vals.min().item()
-                    vmax = vals.max().item()
-                    print(f"    dim {d}: mean={mean:.4f}, std={std:.4f}, "
-                        f"min={vmin:.4f}, max={vmax:.4f}")
             
     def score_branch(self, branch_traj: AbstractTrajectory, branch_outputs: Dict[str, torch.Tensor]) -> float:
         """
@@ -249,11 +188,13 @@ class DiffusionPlanner(AbstractPlanner):
         - collision_penalty: large penalty if predicted ego-neighbor distance gets too small
         """
 
-        # Get list of states along the trajectory
-        try:
-            states = branch_traj.get_sampled_trajectory()
-        except AttributeError:
-            states = getattr(branch_traj, "_trajectory", [])
+        # InterpolatedTrajectory already stores the discrete list in _trajectory
+        states = getattr(branch_traj, "_trajectory", None)
+        if states is None:
+            try:
+                states = branch_traj.get_sampled_trajectory()
+            except AttributeError:
+                states = []
 
         if not states or len(states) < 2:
             # Very bad score if we don't have a meaningful trajectory
@@ -278,33 +219,31 @@ class DiffusionPlanner(AbstractPlanner):
         smoothness_penalty = sum(heading_changes)
 
         # --- Collision component (predicted ego vs neighbors) ---
+        # Fast path: compute on CPU (xy only). Avoids per-branch GPU kernels + sync.
         collision_penalty = 0.0
         pred = branch_outputs.get("prediction", None)
         try:
             if pred is not None:
-                # pred: [B, A, T, 4], we assume B=1 here
-                pred_np = pred.detach().cpu().numpy()
-                if pred_np.shape[0] > 0 and pred_np.shape[1] > 1:
-                    # ego positions and neighbor positions in the model's frame
-                    ego_xy = pred_np[0, 0, :, :2]              # [T, 2]
-                    neighbors_xy = pred_np[0, 1:, :, :2]       # [N, T, 2]
+                # Accept [B, P, T, 4] (expected) or [P, T, 4]
+                pred_xy = pred[0, :, :, :2] if pred.ndim == 4 else (pred[:, :, :2] if pred.ndim == 3 else None)
+                if pred_xy is not None and pred_xy.shape[0] > 1:
+                    pred_xy_np = pred_xy.detach().cpu().numpy()     # [P, T, 2]
+                    ego_xy = pred_xy_np[0]                          # [T, 2]
+                    neigh_xy = pred_xy_np[1:]                       # [N, T, 2]
 
-                    if neighbors_xy.size > 0:
-                        # Compute distances: [N, T]
-                        diff = neighbors_xy - ego_xy[None, :, :]   # broadcast over neighbors
-                        dist = np.linalg.norm(diff, axis=-1)
-                        min_dist = float(dist.min())
+                    diff = neigh_xy - ego_xy[None, :, :]            # [N, T, 2]
+                    dist2 = (diff * diff).sum(axis=-1)              # [N, T]
+                    min_dist2 = float(dist2.min())
 
-                        # Simple piecewise penalty
-                        if min_dist < 1.0:
-                            collision_penalty = 100.0
-                        elif min_dist < 2.0:
-                            collision_penalty = (2.0 - min_dist) * 20.0
-                        else:
-                            collision_penalty = 0.0
+                    if min_dist2 < 1.0:                             # < (1m)^2
+                        collision_penalty = 100.0
+                    elif min_dist2 < 4.0:                           # < (2m)^2
+                        min_dist = math.sqrt(min_dist2)
+                        collision_penalty = (2.0 - min_dist) * 20.0
         except Exception as e:
-            print(f"[DEBUG][score_branch] collision term error: {e}")  # TODO-s: remove
-
+            if getattr(self, "_debug_verbose", False):
+                print(f"[DEBUG][score_branch] collision term error: {e}")
+                
         # We want:
         # - more progress -> better (lower score)
         # - less heading change -> better (lower score)
@@ -321,12 +260,12 @@ class DiffusionPlanner(AbstractPlanner):
             w_collision * collision_penalty
         )
 
-        # Debug print
-        print(
-            f"[DEBUG][score_branch] progress={progress:.2f}, "
-            f"smooth_pen={smoothness_penalty:.2f}, "
-            f"coll_pen={collision_penalty:.2f}, score={score:.2f}"
-        )  # TODO-s: remove
+        if self._debug_verbose:
+            print(
+                f"[DEBUG][score_branch] progress={progress:.2f}, "
+                f"smooth_pen={smoothness_penalty:.2f}, "
+                f"coll_pen={collision_penalty:.2f}, score={score:.2f}"
+            )
 
         return score
 
@@ -362,7 +301,8 @@ class DiffusionPlanner(AbstractPlanner):
 
         # Fallback: if anything went wrong, default to parent 0
         if global_best_parent_traj is None or parent0_best_score is None:
-            print("[DEBUG][get_best_trajectory] fallback to parent 0")
+            # if self._debug_verbose:
+            #     print("[DEBUG][get_best_trajectory] fallback to parent 0")
             return trajectories[0].parent_trajectory
 
         # Margin in score units (lower is better). With scores typically in [-55, -82],
@@ -370,10 +310,11 @@ class DiffusionPlanner(AbstractPlanner):
         # clearly better (by > 4 points).
         MARGIN = 4.0
 
-        print(
-            f"[DEBUG][get_best_trajectory] parent0_best={parent0_best_score:.2f}, "
-            f"global_best={global_best_score:.2f}, margin={MARGIN:.2f}"
-        )
+        # if self._debug_verbose:
+        #     print(
+        #         f"[DEBUG][get_best_trajectory] parent0_best={parent0_best_score:.2f}, "
+        #         f"global_best={global_best_score:.2f}, margin={MARGIN:.2f}"
+        #     )
 
         selected_non_parent0 = (global_best_score + MARGIN < parent0_best_score)
 
@@ -398,9 +339,6 @@ class DiffusionPlanner(AbstractPlanner):
             print("[DEBUG][get_best_trajectory] keeping parent0 trajectory")
             return trajectories[0].parent_trajectory
 
-
-
-
     
     # function to add noise to inputs
     def _add_noise_to_inputs(
@@ -417,17 +355,261 @@ class DiffusionPlanner(AbstractPlanner):
             # by default, only perturb dynamic tensors
             keys = ["ego_agent_past", "neighbor_agents_past"]
 
+        if std <= 0.0:
+            return inputs  # fast path: no allocations
+
         noisy = {}
         for k, v in inputs.items():
-            if isinstance(v, torch.Tensor) and k in keys:
-                # don't touch masks / one-hots
-                if "mask" in k or "type" in k:
-                    noisy[k] = v.clone()
-                else:
-                    noisy[k] = v + torch.randn_like(v) * std
+            if isinstance(v, torch.Tensor) and (k in keys) and ("mask" not in k) and ("type" not in k):
+                noisy[k] = v + torch.randn_like(v) * std
             else:
-                noisy[k] = v.clone() if isinstance(v, torch.Tensor) else v
+                noisy[k] = v  # reuse tensor/reference (no clone)
         return noisy
+    
+
+    def roll_inputs_with_predictions_multi_agent(
+        self,
+        original_inputs: Dict[str, torch.Tensor],
+        parent_outputs: Dict[str, torch.Tensor],
+        num_new_ticks: int = 1,
+        k_neighbors: int = None,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Build a new model inputs dict where:
+        - neighbor_agents_past is rolled forward by 1 tick,
+        - the last history step of the first K neighbors is replaced
+            by the model's predicted state at t=1,
+        - ego_current_state and other keys are copied unchanged.
+
+        This does NOT change the coordinate frame; it just injects the
+        predicted next-step states into the history tensor.
+
+        Args:
+            original_inputs: dict as passed to the planner
+            parent_outputs: dict containing key 'prediction' with shape [1, P, T, 4]
+            num_new_ticks: currently only 1 is supported (one-step roll)
+            k_neighbors: how many predicted neighbors to use (<= P-1 and <= N).
+                        If None, we use all P-1 predicted neighbors (clipped by N).
+
+        Returns:
+            new_inputs: dict with rolled 'neighbor_agents_past'.
+            (Call observation_normalizer(new_inputs) before reusing.)
+        """
+
+        pred = parent_outputs["prediction"]
+
+        Bp, P, T, Dout = pred.shape
+
+        neigh = original_inputs["neighbor_agents_past"]
+
+        Bn, N, H, Dn = neigh.shape
+        if Bn != 1:
+            raise ValueError(f"Only batch size 1 is supported for neighbor_agents_past, got B={Bn}")
+
+        # How many neighbors do we update from prediction?
+        # We assume P = 1 (ego) + K neighbors.
+        max_pred_neighbors = max(P - 1, 0)
+        if max_pred_neighbors == 0:
+            raise ValueError("prediction must have at least 2 participants (ego + neighbor).")
+
+        if k_neighbors is None:
+            K = max_pred_neighbors
+        else:
+            K = min(k_neighbors, max_pred_neighbors)
+        K = min(K, N)  # cannot exceed number of neighbor slots
+
+        if K <= 0:
+            raise ValueError(f"k_neighbors must resolve to >0, got K={K}")
+
+        # New neighbor history tensor
+        new_neigh = neigh.clone()
+
+        # Roll ALL neighbors by 1 tick (vectorized): new[..., 0:H-1] = old[..., 1:H]
+        new_neigh[:, :, :-1, :] = neigh[:, :, 1:, :]
+
+        # Default last row: repeat last known state (same as your else-branch)
+        new_neigh[:, :, -1, :] = neigh[:, :, -1, :]
+
+        # Overwrite last row dims 0..3 for first K neighbors using prediction at t=1
+        # pred: [1, P, T, 4] where participants 1..K correspond to neighbors 0..K-1
+        pred_t1 = pred[0, 1:1 + K, 1, :4]
+        if pred_t1.dtype != new_neigh.dtype or pred_t1.device != new_neigh.device:
+            pred_t1 = pred_t1.to(dtype=new_neigh.dtype, device=new_neigh.device)
+        new_neigh[0, :K, -1, :4] = pred_t1
+
+        new_inputs = dict(original_inputs)  # shallow copy (no tensor clones)
+        new_inputs["neighbor_agents_past"] = new_neigh
+        return new_inputs
+    
+
+    def _stack_model_inputs(self, inputs_list: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        """Concat a list of per-sample input dicts (each with batch=1 tensors) into a single batched dict."""
+        assert len(inputs_list) > 0
+        batched: Dict[str, torch.Tensor] = {}
+
+        keys = inputs_list[0].keys()
+        for k in keys:
+            v0 = inputs_list[0][k]
+            if isinstance(v0, torch.Tensor):
+                batched[k] = torch.cat([d[k] for d in inputs_list], dim=0)  # [B, ...]
+            else:
+                # Non-tensors (rare in model inputs) must be identical across batch; keep first.
+                batched[k] = v0
+        return batched
+
+
+    def _split_model_outputs(self, outputs: Dict[str, torch.Tensor], batch_size: int) -> List[Dict[str, torch.Tensor]]:
+        """Split a batched output dict into a list of per-sample output dicts (each with batch=1 tensors)."""
+        out_list: List[Dict[str, torch.Tensor]] = []
+        for i in range(batch_size):
+            oi: Dict[str, torch.Tensor] = {}
+            for k, v in outputs.items():
+                if isinstance(v, torch.Tensor):
+                    oi[k] = v[i:i + 1]  # keep batch dimension = 1
+                else:
+                    oi[k] = v
+            out_list.append(oi)
+        return out_list
+
+
+    def _planner_forward_batched(self, inputs_list: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.Tensor]]:
+            """
+            Run self._planner on a list of per-sample input dicts in one batched forward pass.
+            Returns a list of per-sample output dicts (each with batch=1 tensors).
+            """
+            bs = len(inputs_list)
+            do_check = (bs not in self._checked_batch_sizes)
+            self._batch_check_this_call = do_check
+            try:
+                batched_inputs = self._stack_model_inputs(inputs_list)
+
+                # One-time, cheap sanity checks per batch size (helps before bs=6)
+                if bs not in self._checked_batch_sanity:
+                    for k in self._batch_sanity_keys:
+                        if k in batched_inputs:
+                            v = batched_inputs[k]
+                            assert isinstance(v, torch.Tensor), f"{k} must be a Tensor, got {type(v)}"
+                            assert v.ndim >= 1 and v.shape[0] == bs, f"{k}: expected batch={bs}, got shape={tuple(v.shape)}"
+                    self._checked_batch_sanity.add(bs)
+
+                with torch.no_grad():
+                    _, outputs = self._planner(batched_inputs)
+                out_list = self._split_model_outputs(outputs, batch_size=bs)
+
+                if do_check:
+                    self._checked_batch_sizes.add(bs)
+                return out_list
+            finally:
+                self._batch_check_this_call = False
+
+
+
+    def compute_planner_trajectory(self, current_input: PlannerInput) -> AbstractTrajectory:
+        """
+        v0.5:
+        - Multiple parents (roots): different noisy samples from the same observation.
+        - For each parent: build branches by rolling inputs + noise.
+        - Score leaves and select the parent of the best leaf.
+        """
+        # RAW inputs from DataProcessor
+        inputs_raw = self.planner_input_to_model_inputs(current_input)
+
+        # Normalize for the model (cloning everything here is expensive).
+        # Assumption: observation_normalizer does NOT mutate inputs_raw in-place.
+        norm_inputs = self.observation_normalizer(inputs_raw)
+
+        # Tree shape
+        num_of_parents = 3
+        num_of_branches = 2
+
+        # Noise levels
+        parent_noise_std = 0.02  # parent 0 will be baseline-like (std=0)
+        branch_noise_std = 0.02  # same scale for branches
+
+        all_traj: List[DiffusionPlanner.MidOutput] = []
+
+        parent_inputs_list: List[Dict[str, torch.Tensor]] = []
+        for parent_idx in range(num_of_parents):
+            cur_parent_noise = 0.0 if parent_idx == 0 else parent_noise_std
+            parent_inputs_list.append(self._add_noise_to_inputs(norm_inputs, std=cur_parent_noise))
+
+        # One model call for all parents (batch size = 3)
+        parent_outputs_list = self._planner_forward_batched(parent_inputs_list)
+
+        # For each parent: roll -> generate 2 branches in a single batched call (batch size = 2)
+        for parent_idx, parent_outputs in enumerate(parent_outputs_list):
+            if self._debug_verbose:
+                print("debugging GPU memory usage")
+                print(parent_outputs["prediction"].requires_grad)
+                print("PARENT requires_grad:", parent_outputs["prediction"].requires_grad, parent_outputs["prediction"].grad_fn)
+
+            parent_traj = InterpolatedTrajectory(
+                trajectory=self.outputs_to_trajectory(parent_outputs, current_input.history.ego_states)
+            )
+            mo = self.MidOutput(parent_traj, parent_outputs)
+            all_traj.append(mo)
+
+            # Build rolled RAW inputs using this parent's outputs
+            rolled_inputs_raw = self.roll_inputs_with_predictions_multi_agent(
+                original_inputs=inputs_raw,
+                parent_outputs=parent_outputs,
+                num_new_ticks=1,
+                k_neighbors=5,
+            )
+            # Normalize rolled inputs before branch passes
+            rolled_inputs = self.observation_normalizer(rolled_inputs_raw)
+
+            # Two branch inputs (batch size = 2)
+            branch_inputs_list: List[Dict[str, torch.Tensor]] = []
+            for _ in range(num_of_branches):
+                branch_inputs_list.append(self._add_noise_to_inputs(rolled_inputs, std=branch_noise_std))
+
+            # One model call for both branches (batch size = 2)
+            branch_outputs_list = self._planner_forward_batched(branch_inputs_list)
+
+            for branch_outputs in branch_outputs_list:
+                branch_traj = InterpolatedTrajectory(
+                    trajectory=self.outputs_to_trajectory(branch_outputs, current_input.history.ego_states)
+                )
+                mo.add_branch(branch_traj, branch_outputs)
+
+                if self._debug_verbose:
+                    print("BRANCH requires_grad:", branch_outputs["prediction"].requires_grad, branch_outputs["prediction"].grad_fn)
+
+        # Choose parent based on best leaf (branch)
+        return self.get_best_trajectory(all_traj)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
     def debug_print_planner_outputs(self, parent_outputs: Dict[str, torch.Tensor], ego_state_history=None) -> None:
@@ -511,112 +693,6 @@ class DiffusionPlanner(AbstractPlanner):
                 print(f"[debug_print_planner_outputs] outputs_to_trajectory failed: {e}")
 
 
-    def roll_inputs_with_predictions_multi_agent(
-        self,
-        original_inputs: Dict[str, torch.Tensor],
-        parent_outputs: Dict[str, torch.Tensor],
-        num_new_ticks: int = 1,
-        k_neighbors: int = None,
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Build a new model inputs dict where:
-        - neighbor_agents_past is rolled forward by 1 tick,
-        - the last history step of the first K neighbors is replaced
-            by the model's predicted state at t=1,
-        - ego_current_state and other keys are copied unchanged.
-
-        This does NOT change the coordinate frame; it just injects the
-        predicted next-step states into the history tensor.
-
-        Args:
-            original_inputs: dict as passed to the planner
-            parent_outputs: dict containing key 'prediction' with shape [1, P, T, 4]
-            num_new_ticks: currently only 1 is supported (one-step roll)
-            k_neighbors: how many predicted neighbors to use (<= P-1 and <= N).
-                        If None, we use all P-1 predicted neighbors (clipped by N).
-
-        Returns:
-            new_inputs: dict with rolled 'neighbor_agents_past'.
-            (Call observation_normalizer(new_inputs) before reusing.)
-        """
-
-        pred = parent_outputs["prediction"]
-
-        Bp, P, T, Dout = pred.shape
-
-        neigh = original_inputs["neighbor_agents_past"]
-
-        Bn, N, H, Dn = neigh.shape
-        if Bn != 1:
-            raise ValueError(f"Only batch size 1 is supported for neighbor_agents_past, got B={Bn}")
-
-        # How many neighbors do we update from prediction?
-        # We assume P = 1 (ego) + K neighbors.
-        max_pred_neighbors = max(P - 1, 0)
-        if max_pred_neighbors == 0:
-            raise ValueError("prediction must have at least 2 participants (ego + neighbor).")
-
-        if k_neighbors is None:
-            K = max_pred_neighbors
-        else:
-            K = min(k_neighbors, max_pred_neighbors)
-        K = min(K, N)  # cannot exceed number of neighbor slots
-
-        if K <= 0:
-            raise ValueError(f"k_neighbors must resolve to >0, got K={K}")
-
-        # New neighbor history tensor
-        new_neigh = neigh.clone()
-
-        # For each neighbor slot
-        for n_idx in range(N):
-            hist = neigh[0, n_idx]  # [H, Dn]
-            new_hist = hist.clone()
-
-            # Roll history by 1: drop earliest, shift left
-            # old: t=0..H-1 -> new: t=0..H-2 are old t=1..H-1
-            new_hist[:-1, :] = hist[1:, :]
-
-            if n_idx < K:
-                # This neighbor has a predicted trajectory in 'prediction'
-                # participant index in prediction: 1 + n_idx (0 is ego)
-                pred_traj = pred[0, 1 + n_idx]  # [T, Dout]
-                pred_t1 = pred_traj[1]          # state at t=1, [Dout]
-
-                # Start from last old row to preserve extra dims (size, type, etc.)
-                row = new_hist[-1].clone()
-
-                # Overwrite the first 4 dims: x, y, cos, sin
-                row[0] = pred_t1[0]
-                row[1] = pred_t1[1]
-                row[2] = pred_t1[2]
-                row[3] = pred_t1[3]
-                # We could try to infer speed and other dims here if needed,
-                # but for now we leave them unchanged.
-
-                new_hist[-1] = row
-                # if n_idx == 0:
-                    # # sanity check for first neighbor: last row vs pred_t1
-                    # diff = (new_hist[-1, :4] - pred_t1).abs()
-                    # print("[sanity] neighbor 0 last row vs pred_t1 diff:", diff.tolist())
-            else:
-                # For neighbors without explicit prediction, we simply repeat
-                # their last known state in the final slot.
-                new_hist[-1, :] = hist[-1, :]
-
-            new_neigh[0, n_idx] = new_hist
-
-        # Build the new inputs dict
-        new_inputs: Dict[str, torch.Tensor] = {}
-        for k, v in original_inputs.items():
-            if k == "neighbor_agents_past":
-                new_inputs[k] = new_neigh
-            else:
-                new_inputs[k] = v.clone() if isinstance(v, torch.Tensor) else v
-
-        return new_inputs
-    
-
     def debug_check_roll_multi_agent(
         self,
         original_inputs: Dict[str, torch.Tensor],
@@ -669,66 +745,72 @@ class DiffusionPlanner(AbstractPlanner):
         print("\n--- prediction for neighbor 0 (participant 1), t=0,1 (dims 0..3) ---")
         print("  pred t=0:", pred_t0[:4].tolist())
         print("  pred t=1:", pred_t1[:4].tolist())
-        
-    def compute_planner_trajectory(self, current_input: PlannerInput) -> AbstractTrajectory:
-        """
-        v0.5:
-        - Multiple parents (roots): different noisy samples from the same observation.
-        - For each parent: build branches by rolling inputs + noise.
-        - Score leaves and select the parent of the best leaf.
-        """
-        # RAW inputs from DataProcessor
-        inputs_raw = self.planner_input_to_model_inputs(current_input)
 
-        # Normalized inputs for the parent pass (original behavior)
-        norm_inputs = self.observation_normalizer(inputs_raw)
 
-        # Tree shape
-        num_of_parents = 3
-        num_of_branches = 2
+    def debug_print_model_inputs(self,model_inputs: dict, ego_state_history) -> None:
+        print("\n========== [PlannerInput Debug] ==========")
 
-        # Noise levels
-        parent_noise_std = 0.02  # small; parent 0 will effectively be near-original
-        branch_noise_std = 0.02  # same scale for branches
-
-        all_traj: List[DiffusionPlanner.MidOutput] = []
-
-        for parent_idx in range(num_of_parents):
-            # For parent 0 you can optionally reduce noise for a "baseline-like" parent
-            if parent_idx == 0:
-                cur_parent_noise = 0.0
-            else:
-                cur_parent_noise = parent_noise_std
-
-            # Parent prediction: same observation, different noise per parent
-            noisy_parent_inputs = self._add_noise_to_inputs(norm_inputs, std=cur_parent_noise)
-            _, parent_outputs = self._planner(noisy_parent_inputs)
-
-            parent_traj = InterpolatedTrajectory(
-                trajectory=self.outputs_to_trajectory(parent_outputs, current_input.history.ego_states)
+        # ----- Ego history from nuPlan buffer -----
+        history_list = list(ego_state_history)
+        print(f"# ego_states in history buffer: {len(history_list)}")
+        if history_list:
+            last = history_list[-1]
+            print(
+                "last ego state (world): "
+                f"x={last.rear_axle.x:.3f}, "
+                f"y={last.rear_axle.y:.3f}, "
+                f"yaw={float(last.rear_axle.heading):.3f}, "
+                f"speed={float(last.dynamic_car_state.speed):.3f}"
             )
-            mo = self.MidOutput(parent_traj, parent_outputs)
-            all_traj.append(mo)
 
-            # Build rolled RAW inputs using this parent's outputs
-            rolled_inputs_raw = self.roll_inputs_with_predictions_multi_agent(
-                original_inputs=inputs_raw,
-                parent_outputs=parent_outputs,
-                num_new_ticks=1,
-                k_neighbors=5,
-            )
-            # Normalize rolled inputs before branch passes
-            rolled_inputs = self.observation_normalizer(rolled_inputs_raw)
+        print("\n=== [Model Inputs Dict] ===")
+        for name, v in model_inputs.items():
+            if not isinstance(v, torch.Tensor):
+                print(f"{name}: non-tensor (type={type(v)})")
+                continue
 
-            # Branch predictions for this parent
-            for branch_idx in range(num_of_branches):
-                noisy_branch_inputs = self._add_noise_to_inputs(rolled_inputs, std=branch_noise_std)
-                _, branch_outputs = self._planner(noisy_branch_inputs)
+            shape = tuple(v.shape)
+            print(f"{name}: shape={shape}, dtype={v.dtype}, device={v.device}")
 
-                branch_traj = InterpolatedTrajectory(
-                    trajectory=self.outputs_to_trajectory(branch_outputs, current_input.history.ego_states)
-                )
-                mo.add_branch(branch_traj, branch_outputs)
+            # Generic stats for float tensors
+            if v.dtype.is_floating_point:
+                flat = v.detach().cpu().view(-1)
+                mean = flat.mean().item()
+                std = flat.std().item()
+                vmin = flat.min().item()
+                vmax = flat.max().item()
+                print(f"  stats: mean={mean:.4f}, std={std:.4f}, min={vmin:.4f}, max={vmax:.4f}")
 
-        # Choose parent based on best leaf (branch)
-        return self.get_best_trajectory(all_traj)
+            # Special cases we care about
+
+            if name == "ego_current_state":
+                # ego_current_state is [1, D] or [B, D]
+                ecs = v[0].detach().cpu()
+                print("  ego_current_state[0]:")
+                for i, val in enumerate(ecs):
+                    print(f"    dim {i}: {val:.4f}")
+                # heuristic: show norm of [cos, sin] if dims 2,3 exist
+                if ecs.shape[0] >= 4:
+                    cs_norm = (ecs[2]**2 + ecs[3]**2).sqrt().item()
+                    print(f"    -> orientation norm (dim2,3): {cs_norm:.4f}")
+
+            if name == "neighbor_agents_past" and v.ndim == 4:
+                B, N, H, D = v.shape
+                print(f"  neighbor_agents_past: B={B}, N={N}, H={H}, D={D}")
+                # Show one example agent over time
+                sample = v[0, 0]  # [H, D]
+                print("  sample neighbor 0 history (first 3 timesteps, first 8 dims):")
+                for t in range(min(3, H)):
+                    row = sample[t, :8].detach().cpu().tolist()
+                    print(f"    t={t}: {['%.4f' % x for x in row]}")
+
+                # Per-feature stats like you already printed
+                print("  --- per-feature stats over all (B,N,H) ---")
+                for d in range(D):
+                    vals = v[..., d].detach().cpu().view(-1)
+                    mean = vals.mean().item()
+                    std = vals.std().item()
+                    vmin = vals.min().item()
+                    vmax = vals.max().item()
+                    print(f"    dim {d}: mean={mean:.4f}, std={std:.4f}, "
+                        f"min={vmin:.4f}, max={vmax:.4f}")

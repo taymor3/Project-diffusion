@@ -102,6 +102,7 @@ class Decoder(nn.Module):
                 }
         else:
             # [B, 1 + predicted_neighbor_num, (1 + V_future) * 4]
+            # TODO-shadi: Batch size probably 1 now, can make more for parallelism
             xT = torch.cat([current_states[:, :, None], torch.randn(B, P, self._future_len, 4).to(current_states.device) * 0.5], dim=2).reshape(B, P, -1)
 
             def initial_state_constraint(xt, t, step):

@@ -8,7 +8,7 @@ def dpm_sampler(
         x_T, 
         other_model_params: Dict={}, 
         diffusion_steps=10,
-
+# TODO-shadi: try to do less steps, can make more divergent predictions
         noise_schedule_params: Dict = {},
         model_wrapper_params: Dict = {},
         dpm_solver_params: Dict = {},
