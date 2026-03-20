@@ -77,10 +77,10 @@ class DiffusionPlanner(AbstractPlanner):
         self._sel_parent0_all = 0
         self._sel_non_parent0_all = 0
 
-        self._sel_print_every = 0   # 0 disables periodic stats printing
-        self._debug_verbose = False
+        self._sel_print_every = 149   # 0 disables periodic stats printing
+        self._debug_verbose = True
 
-        self._margin = 4.0          # parent0 override margin (lower score is better)
+        self._margin = 10.0          # parent0 override margin (lower score is better)
         self._model_loaded = False  # avoid re-loading checkpoint every scenario
 
         # Lightweight batch sanity checks (only once per batch size)
@@ -206,12 +206,14 @@ class DiffusionPlanner(AbstractPlanner):
             # List to hold branch trajectories and their outputs
             self.branch_trajectories: List[AbstractTrajectory] = []
             self.branch_outputs: List[Dict[str, torch.Tensor]] = []
+            self.branch_inputs: List[Dict[str, torch.Tensor]] = []
 
 
         # Method to add a branch trajectory and its outputs
-        def add_branch(self, branch_trajectory: AbstractTrajectory, branch_output: Dict[str, torch.Tensor]):
+        def add_branch(self, branch_trajectory: AbstractTrajectory, branch_output: Dict[str, torch.Tensor], branch_input: Dict[str, torch.Tensor]):
             self.branch_trajectories.append(branch_trajectory)
             self.branch_outputs.append(branch_output)
+            self.branch_inputs.append(branch_input)
 
 
     def _sel_reset(self) -> None:
@@ -229,7 +231,7 @@ class DiffusionPlanner(AbstractPlanner):
         )
 
             
-    def score_branch(self, branch_traj: AbstractTrajectory, branch_outputs: Dict[str, torch.Tensor]) -> float:
+    def score_branch(self, branch_traj: AbstractTrajectory, branch_outputs: Dict[str, torch.Tensor], branch_inputs: Dict[str, torch.Tensor] = None) -> float:
         """
         Heuristic score for a branch trajectory.
         Lower score is better.
@@ -238,6 +240,9 @@ class DiffusionPlanner(AbstractPlanner):
         - progress: how far ego moves along the path (more is better)
         - smoothness: sum of absolute heading changes (less is better)
         - collision_penalty: large penalty if predicted ego-neighbor distance gets too small
+                            (all directions: front / side / rear)
+        - front_proximity_penalty: soft penalty if a vehicle is close in front
+        - progress_gate: reduces progress reward when the ego is blocked by a front vehicle
         """
 
         # InterpolatedTrajectory already stores the discrete list in _trajectory
@@ -253,70 +258,224 @@ class DiffusionPlanner(AbstractPlanner):
                 print("[DEBUG][score_branch] too few states in branch trajectory")
             return 1e9
 
-        # --- Progress component ---
-        start = states[0].rear_axle
-        end = states[-1].rear_axle
+        # ------------------------------------------------------------------
+        # 1) Progress component
+        # ------------------------------------------------------------------
+        pts = np.array(
+            [[float(s.rear_axle.x), float(s.rear_axle.y)] for s in states],
+            dtype=np.float64,
+        )
+        deltas = np.diff(pts, axis=0)
+        step_lengths = np.linalg.norm(deltas, axis=1)
+        progress = float(step_lengths.sum())
 
-        dx = float(end.x - start.x)
-        dy = float(end.y - start.y)
-        progress = math.sqrt(dx * dx + dy * dy)
-
-        # --- Smoothness component (heading changes) ---
+        # ------------------------------------------------------------------
+        # 2) Smoothness component (heading changes)
+        # ------------------------------------------------------------------
         headings = [float(s.rear_axle.heading) for s in states]
         heading_changes = []
         for h0, h1 in zip(headings[:-1], headings[1:]):
-            # Wrap difference to [-pi, pi] to avoid jumps
             dh = (h1 - h0 + math.pi) % (2.0 * math.pi) - math.pi
             heading_changes.append(abs(dh))
-        smoothness_penalty = sum(heading_changes)
+        smoothness_penalty = float(np.mean(heading_changes)) if heading_changes else 0.0
 
-        # --- Collision component (predicted ego vs neighbors) ---
-        # Fast path: compute on CPU (xy only). Avoids per-branch GPU kernels + sync.
+        # ------------------------------------------------------------------
+        # 3) Prediction-based safety / context terms
+        # ------------------------------------------------------------------
         collision_penalty = 0.0
+        front_proximity_penalty = 0.0
+        progress_gate = 1.0
+        min_front_clearance = float("inf")
+        min_dist = float("inf")
+        min_collision_clearance = float("inf")
+        min_clearance = float("inf")
+
         pred = branch_outputs.get("prediction", None)
+
         try:
             if pred is not None:
-                # Accept [B, P, T, 4] (expected) or [P, T, 4]
                 pred_xy = pred[0, :, :, :2] if pred.ndim == 4 else (pred[:, :, :2] if pred.ndim == 3 else None)
+
                 if pred_xy is not None and pred_xy.shape[0] > 1:
-                    pred_xy_np = pred_xy.detach().cpu().numpy()     # [P, T, 2]
-                    ego_xy = pred_xy_np[0]                          # [T, 2]
-                    neigh_xy = pred_xy_np[1:]                       # [N, T, 2]
+                    pred_xy_np = pred_xy.detach().cpu().numpy().astype(np.float64)   # [P, T, 2]
+                    ego_xy = pred_xy_np[0]                                           # [T, 2]
+                    neigh_xy = pred_xy_np[1:]                                        # [N, T, 2]
 
-                    diff = neigh_xy - ego_xy[None, :, :]            # [N, T, 2]
-                    dist2 = (diff * diff).sum(axis=-1)              # [N, T]
-                    min_dist2 = float(dist2.min())
+                    # Filter padded / inactive neighbor slots using the branch input history.
+                    if branch_inputs is not None and "neighbor_agents_past" in branch_inputs:
+                        neigh_hist = (
+                            branch_inputs["neighbor_agents_past"][0, :, :, :2]
+                            .detach()
+                            .cpu()
+                            .numpy()
+                            .astype(np.float64)
+                        )  # [N, H, 2]
 
-                    if min_dist2 < 1.0:                             # < (1m)^2
-                        collision_penalty = 100.0
-                    elif min_dist2 < 4.0:                           # < (2m)^2
-                        min_dist = math.sqrt(min_dist2)
-                        collision_penalty = (2.0 - min_dist) * 20.0
+                        valid_neighbor = np.any(np.abs(neigh_hist) > 1e-3, axis=(1, 2))
+                        valid_neighbor = valid_neighbor[: neigh_xy.shape[0]]
+                        neigh_xy = neigh_xy[valid_neighbor]
+
+                    if neigh_xy.shape[0] > 0:
+                        diff = neigh_xy - ego_xy[None, :, :]                # [N, T, 2]
+                        center_dist = np.linalg.norm(diff, axis=-1)         # [N, T]
+                        min_dist = float(center_dist.min())                 # raw center distance for debug
+
+                        # -------------------------------------------------------
+                        # Geometry in the SAME frame as branch_outputs["prediction"]
+                        #
+                        # branch_outputs["prediction"][..., :2] is already in the model's
+                        # ego-local prediction frame. Do NOT rotate it again using the
+                        # decoded global headings from `states`.
+                        #
+                        # In this frame:
+                        #   x = forward
+                        #   y = lateral
+                        # -------------------------------------------------------
+                        T_eval = center_dist.shape[1]
+                        rel = diff[:, :T_eval, :]                           # [N, T, 2]
+                        dist = center_dist[:, :T_eval]                      # [N, T]
+
+                        forward_proj = rel[..., 0]                          # [N, T]
+                        lateral_proj = rel[..., 1]                          # [N, T]
+
+                        # -------------------------------------------------------
+                        # Angle-aware collision clearance
+                        #
+                        # By your center-distance geometry:
+                        # - straight ahead / behind touching  -> 4.0 m
+                        # - pure side-by-side touching        -> 2.0 m
+                        #
+                        # Model touching distance as an ellipse in ego frame.
+                        # -------------------------------------------------------
+                        abs_forward = np.abs(forward_proj)
+                        abs_lateral = np.abs(lateral_proj)
+
+                        collision_angle = np.arctan2(abs_lateral, abs_forward + 1e-9)  # [N, T], 0..pi/2
+
+                        touch_dist = 1.0 / np.sqrt(
+                            (np.cos(collision_angle) ** 2) / (4.0 ** 2) +
+                            (np.sin(collision_angle) ** 2) / (2.0 ** 2) +
+                            1e-9
+                        )  # [N, T]
+
+                        # clearance > 0 : separated
+                        # clearance <= 0: touching / overlap
+                        collision_clearance = dist - touch_dist
+                        min_collision_clearance = float(collision_clearance.min())
+                        min_clearance = min_collision_clearance  # keep debug print compatible
+
+                        # Frontness score in [0, 1]:
+                        # 0 -> side/rear, 1 -> straight ahead
+                        ahead_cos = np.clip(forward_proj / np.maximum(dist, 1e-9), 0.0, 1.0)  # [N, T]
+
+                        # -------------------------------------------------------
+                        # 3a) Collision penalty
+                        #
+                        # Broad cone for true turning conflicts.
+                        # Side-parallel cars should have almost no influence unless touching.
+                        # -------------------------------------------------------
+                        if min_collision_clearance <= 0.0:
+                            collision_penalty = 100.0
+                        else:
+                            collision_mask = (forward_proj > 0.0) & (ahead_cos > 0.15)
+
+                            if np.any(collision_mask):
+                                collision_clearance_front = collision_clearance[collision_mask]
+                                ahead_front = ahead_cos[collision_mask]
+
+                                near_margin = 1.5
+                                near_risk = np.clip(
+                                    (near_margin - collision_clearance_front) / near_margin,
+                                    0.0,
+                                    1.0,
+                                )
+
+                                # No floor. Side cars get almost zero weight.
+                                ahead_weight = np.clip((ahead_front - 0.15) / 0.85, 0.0, 1.0) ** 2
+
+                                collision_penalty = 35.0 * float((near_risk * ahead_weight).max())
+                            else:
+                                collision_penalty = 0.0
+
+                        # -------------------------------------------------------
+                        # 3b) Front-aware gating / front proximity
+                        #
+                        # Much narrower than the collision cone.
+                        # This term should only react to cars that are actually in front,
+                        # not cars that are merely in a nearby parallel lane.
+                        # -------------------------------------------------------
+                        front_mask = (forward_proj > 1.0) & (ahead_cos > 0.70)
+
+                        if np.any(front_mask):
+                            front_clearance = collision_clearance[front_mask]
+                            min_front_clearance = float(front_clearance.min())
+
+                            # -----------------------------
+                            # Progress gate based on FRONT CLEARANCE
+                            # -----------------------------
+                            if min_front_clearance <= 0.0:
+                                progress_gate = 0.15
+                            elif min_front_clearance < 1.0:
+                                progress_gate = 0.35
+                            elif min_front_clearance < 3.0:
+                                progress_gate = 0.35 + 0.65 * ((min_front_clearance - 1.0) / 2.0)
+                            else:
+                                progress_gate = 1.0
+
+                            # -----------------------------
+                            # Soft front proximity penalty based on FRONT CLEARANCE
+                            # -----------------------------
+                            if min_front_clearance >= 3.0:
+                                front_proximity_penalty = 0.0
+                            elif min_front_clearance > 0.0:
+                                front_proximity_penalty = (3.0 - min_front_clearance) * 1.0
+                            else:
+                                front_proximity_penalty = 4.0 + (-min_front_clearance) * 4.0
+                        else:
+                            progress_gate = 1.0
+                            front_proximity_penalty = 0.0
+                    else:
+                        progress_gate = 1.0
+                        front_proximity_penalty = 0.0
+
         except Exception as e:
             if getattr(self, "_debug_verbose", False):
-                print(f"[DEBUG][score_branch] collision term error: {e}")
-                
-        # We want:
-        # - more progress -> better (lower score)
-        # - less heading change -> better (lower score)
-        # - fewer close contacts -> better (lower score)
-        #
-        # Simple linear combination:
-        w_progress  = -1.0     # negative: more progress reduces score
-        w_smooth    =  0.5     # positive: more heading change increases score
-        w_collision =  1.0     # collision_penalty already scaled large
+                print(f"[DEBUG][score_branch] prediction-based term error: {e}")
+
+        # ------------------------------------------------------------------
+        # 4) Final weighted score
+        # ------------------------------------------------------------------
+        effective_progress = progress * progress_gate
+
+        w_progress = 1.0
+        w_smooth = 20
+        w_collision = 2
+        w_front = 20.0
 
         score = (
-            w_progress  * progress +
-            w_smooth    * smoothness_penalty +
-            w_collision * collision_penalty
+            -w_progress * effective_progress
+            + w_smooth * smoothness_penalty
+            + w_collision * collision_penalty
+            + w_front * front_proximity_penalty
         )
 
         if self._debug_verbose:
+            min_front_clearance_str = "inf" if math.isinf(min_front_clearance) else f"{min_front_clearance:.2f}"
+            min_dist_str = "inf" if math.isinf(min_dist) else f"{min_dist:.2f}"
+            min_clearance_str = "inf" if math.isinf(min_clearance) else f"{min_clearance:.2f}"
+
             print(
-                f"[DEBUG][score_branch] progress={progress:.2f}, "
+                f"[DEBUG][score_branch] "
+                f"progress={progress:.2f}, "
+                f"progress_gate={progress_gate:.2f}, "
+                f"effective_progress={effective_progress:.2f}, "
                 f"smooth_pen={smoothness_penalty:.2f}, "
-                f"coll_pen={collision_penalty:.2f}, score={score:.2f}"
+                f"min_dist={min_dist_str}, "
+                f"min_clearance={min_clearance_str}, "
+                f"min_front_clearance={min_front_clearance_str}, "
+                f"front_pen={front_proximity_penalty:.2f}, "
+                f"coll_pen={collision_penalty:.2f}, "
+                f"score={score:.2f}"
             )
 
         return score
@@ -334,8 +493,8 @@ class DiffusionPlanner(AbstractPlanner):
         parent0_best_score = None
 
         for parent_idx, mo in enumerate(trajectories):
-            for branch_traj, branch_outputs in zip(mo.branch_trajectories, mo.branch_outputs):
-                score = self.score_branch(branch_traj, branch_outputs)
+            for branch_traj, branch_outputs, branch_inputs in zip(mo.branch_trajectories, mo.branch_outputs, mo.branch_inputs):
+                score = self.score_branch(branch_traj, branch_outputs, branch_inputs)
 
                 # Track best score for parent 0 separately
                 if parent_idx == 0:
@@ -613,10 +772,6 @@ class DiffusionPlanner(AbstractPlanner):
         branch_owner: List[int] = []  # maps each branch sample to its parent_idx (keeps parent-branch pairing correct)
 
         for parent_idx, parent_outputs in enumerate(parent_outputs_list):
-            if self._debug_verbose:
-                print("[DEBUG] PARENT requires_grad:",
-                      parent_outputs["prediction"].requires_grad,
-                      parent_outputs["prediction"].grad_fn)
 
             parent_traj = InterpolatedTrajectory(
                 trajectory=self.outputs_to_trajectory(parent_outputs, current_input.history.ego_states)
@@ -644,16 +799,11 @@ class DiffusionPlanner(AbstractPlanner):
         branch_outputs_all = self._planner_forward_batched(branch_inputs_all)
 
         # Assign each branch output back to the correct parent
-        for branch_outputs, parent_idx in zip(branch_outputs_all, branch_owner):
+        for branch_outputs, branch_inputs, parent_idx in zip(branch_outputs_all, branch_inputs_all, branch_owner):
             branch_traj = InterpolatedTrajectory(
                 trajectory=self.outputs_to_trajectory(branch_outputs, current_input.history.ego_states)
             )
-            all_traj[parent_idx].add_branch(branch_traj, branch_outputs)
-
-            if self._debug_verbose:
-                print("[DEBUG] BRANCH requires_grad:",
-                      branch_outputs["prediction"].requires_grad,
-                      branch_outputs["prediction"].grad_fn)
+            all_traj[parent_idx].add_branch(branch_traj, branch_outputs, branch_inputs)
 
         # Choose parent based on best leaf (branch)
         return self.get_best_trajectory(all_traj)
