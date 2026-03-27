@@ -17,6 +17,9 @@ from nuplan.planning.simulation.planner.abstract_planner import (
 from diffusion_planner.model.diffusion_planner import Diffusion_Planner
 from diffusion_planner.data_process.data_processor import DataProcessor
 from diffusion_planner.utils.config import Config
+from tuplan_garage.planning.simulation.planner.pdm_planner.scoring.pdm_scorer import PDMScorer
+from tuplan_garage.planning.simulation.planner.pdm_planner.simulation.pdm_simulator import PDMSimulator
+from tuplan_garage.planning.simulation.planner.pdm_planner.observation.pdm_observation import PDMObservation
 
 
 # nuPlan map spam
@@ -103,6 +106,55 @@ class DiffusionPlanner(AbstractPlanner):
         # True  -> use pred t=0 (the “one-tick” alternative you tested)
         self._roll_use_pred_t0 = False
 
+        # PDM / Diffusion-ES reward scaffold
+        self._pdm_ready = False
+        self._pdm_observation = None
+        self._pdm_simulator = None
+        self._pdm_scorer = None
+
+        self._centerline = None
+        self._drivable_area_map = None
+        self._speed_limit = None
+        self._lead_agent = None
+        self._current_lane = None
+
+        self._current_input = None
+        self._current_ego_state = None
+        self._current_observation_raw = None
+
+        self._pdm_iteration = 0
+
+        self._pdm_scorer_config = {
+            "weighted_metrics": {
+                "progress": 2.0,
+                "ttc": 5.0,
+                "comfortable": 5.0,
+                "lane_following": 1.0,
+                "proximity": 5.0,
+            },
+            "driving_direction_compliance_threshold": 2.0,
+            "driving_direction_violation_threshold": 6.0,
+            "stopped_speed_threshold": 5e-03,
+            "progress_distance_threshold": 0.1,
+            "max_overspeed_value_threshold": 2.23,
+            "max_lane_deviation": 10.0,
+            "max_drivable_area_violation": 0.3,
+            "ttc_fixed_speed": True,
+            "min_distance_to_lead": 1.0,
+            "lane_heading_threshold": 2.35,
+            "ego_scale_factor": 1.0,
+        }
+
+        self._pdm_comfort_config = {
+            "max_abs_mag_jerk": 8.37,
+            "max_abs_lat_accel": 4.89,
+            "max_lon_accel": 2.0,
+            "min_lon_accel": -3.6,
+            "max_abs_yaw_accel": 1.93,
+            "max_abs_lon_jerk": 3.0,
+            "max_abs_yaw_rate": 0.95,
+        }
+
 
 
 
@@ -125,6 +177,22 @@ class DiffusionPlanner(AbstractPlanner):
         """
         self._map_api = initialization.map_api
         self._route_roadblock_ids = initialization.route_roadblock_ids
+
+        # Reset PDM / Diffusion-ES reward state
+        self._pdm_ready = False
+        self._pdm_observation = None
+        self._pdm_simulator = None
+        self._pdm_scorer = None
+        self._centerline = None
+        self._drivable_area_map = None
+        self._speed_limit = None
+        self._lead_agent = None
+        self._current_lane = None
+        self._current_input = None
+        self._current_ego_state = None
+        self._current_observation_raw = None
+        self._pdm_iteration = 0
+
         self._sel_reset()  # reset per-scenario counters (global *_all counters remain)
 
         # ---------------- GPU memory logging: per-scenario reset/summary ----------------
@@ -231,7 +299,7 @@ class DiffusionPlanner(AbstractPlanner):
         )
 
             
-    def score_branch(self, branch_traj: AbstractTrajectory, branch_outputs: Dict[str, torch.Tensor], branch_inputs: Dict[str, torch.Tensor] = None) -> float:
+    def score_branch_legacy(self, branch_traj: AbstractTrajectory, branch_outputs: Dict[str, torch.Tensor], branch_inputs: Dict[str, torch.Tensor] = None) -> float:
         """
         Heuristic score for a branch trajectory.
         Lower score is better.
@@ -480,6 +548,9 @@ class DiffusionPlanner(AbstractPlanner):
 
         return score
 
+    def score_branch(self, branch_traj: AbstractTrajectory, branch_outputs: Dict[str, torch.Tensor], branch_inputs: Dict[str, torch.Tensor] = None) -> float:
+        return self.score_branch_legacy(branch_traj, branch_outputs, branch_inputs)
+
 
     def get_best_trajectory(self, trajectories: List["DiffusionPlanner.MidOutput"]) -> AbstractTrajectory:
         """
@@ -720,6 +791,9 @@ class DiffusionPlanner(AbstractPlanner):
         - All branches (all parents × branches) are generated in one batched model call.
         - Score leaves and return the selected parent trajectory (with margin gate).
         """
+        self._current_input = current_input
+        self._current_ego_state, self._current_observation_raw = current_input.history.current_state
+
         # RAW inputs from DataProcessor
         inputs_raw = self.planner_input_to_model_inputs(current_input)
 
