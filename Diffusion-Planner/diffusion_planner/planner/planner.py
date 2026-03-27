@@ -2,9 +2,11 @@ import math
 import torch
 import warnings
 import numpy as np
+import numpy.typing as npt
 
-from typing import Deque, Dict, List, Type
+from typing import Deque, Dict, List, Type, Tuple
 from nuplan.common.actor_state.ego_state import EgoState
+from nuplan.common.maps.nuplan_map.lane import NuPlanLane
 from nuplan.common.utils.interpolatable_state import InterpolatableState
 from nuplan.planning.simulation.trajectory.trajectory_sampling import TrajectorySampling
 from nuplan.planning.simulation.trajectory.abstract_trajectory import AbstractTrajectory
@@ -31,6 +33,11 @@ from tuplan_garage.planning.simulation.planner.pdm_planner.utils.pdm_geometry_ut
 from tuplan_garage.planning.simulation.planner.pdm_planner.utils.pdm_path import PDMPath
 from tuplan_garage.planning.simulation.planner.pdm_planner.observation.pdm_observation_utils import get_drivable_area_map
 from tuplan_garage.planning.simulation.planner.pdm_planner.utils.route_utils import route_roadblock_correction
+
+from tuplan_garage.planning.simulation.planner.pdm_planner.proposal.batch_idm_policy import BatchIDMPolicy
+from tuplan_garage.planning.simulation.planner.pdm_planner.proposal.pdm_generator import PDMGenerator
+from tuplan_garage.planning.simulation.planner.pdm_planner.proposal.pdm_proposal import PDMProposalManager
+
 
 
 # nuPlan map spam
@@ -122,6 +129,22 @@ class DiffusionPlanner(AbstractPlanner):
         self._pdm_observation = None
         self._pdm_simulator = None
         self._pdm_scorer = None
+        self._pdm_generator = None
+        self._pdm_proposal_manager = None
+
+        self._pdm_trajectory_sampling = TrajectorySampling(num_poses=80, interval_length=0.1)
+        self._pdm_proposal_sampling = TrajectorySampling(num_poses=40, interval_length=0.1)
+
+        self._idm_policies = BatchIDMPolicy(
+            speed_limit_fraction=[0.2, 0.4, 0.6, 0.8, 1.0],
+            fallback_target_velocity=15.0,
+            min_gap_to_lead_agent=1.0,
+            headway_time=1.5,
+            accel_max=1.5,
+            decel_max=3.0,
+        )
+
+        self._lateral_offsets = [-1.0, 1.0]
 
         self._centerline = None
         self._drivable_area_map = None
@@ -207,6 +230,23 @@ class DiffusionPlanner(AbstractPlanner):
         self._current_ego_state = None
         self._current_observation_raw = None
         self._pdm_iteration = 0
+        self._pdm_generator = None
+        self._pdm_proposal_manager = None
+        self._pdm_observation = PDMObservation(
+            self._pdm_trajectory_sampling,
+            self._pdm_trajectory_sampling,
+            self._map_radius,
+        )
+        self._pdm_generator = PDMGenerator(
+            self._pdm_trajectory_sampling,
+            self._pdm_trajectory_sampling,
+        )
+        self._pdm_simulator = PDMSimulator(self._pdm_proposal_sampling)
+        self._pdm_scorer = PDMScorer(
+            self._pdm_proposal_sampling,
+            self._pdm_scorer_config,
+            self._pdm_comfort_config,
+        )
 
         self._sel_reset()  # reset per-scenario counters (global *_all counters remain)
 
@@ -936,7 +976,57 @@ class DiffusionPlanner(AbstractPlanner):
         return on_route_lanes, on_route_heading_errors
 
 
+    def _update_proposal_manager(self, ego_state: EgoState):
+        """
+        Updates or initializes PDMProposalManager class
+        :param ego_state: state of ego-vehicle
+        """
 
+        self._current_lane = self._get_starting_lane(ego_state)
+
+        create_new_proposals = self._pdm_iteration == 0
+
+        if create_new_proposals:
+            proposal_paths: List[PDMPath] = self._get_proposal_paths(self._current_lane)
+
+            self._pdm_proposal_manager = PDMProposalManager(
+                lateral_proposals=proposal_paths,
+                longitudinal_policies=self._idm_policies,
+            )
+
+        self._pdm_proposal_manager.update(self._current_lane.speed_limit_mps)
+
+        if isinstance(self._current_lane, NuPlanLane):
+            self._speed_limit = self._current_lane.speed_limit_mps
+        else:
+            edges = self._current_lane.incoming_edges + self._current_lane.outgoing_edges + [self._current_lane]
+            speed_limits = [edge.speed_limit_mps for edge in edges if edge.speed_limit_mps is not None]
+            self._speed_limit = max(speed_limits) if len(speed_limits) > 0 else 100
+
+
+    def _get_proposal_paths(
+        self, current_lane: LaneGraphEdgeMapObject
+    ) -> List[PDMPath]:
+        """
+        Returns a list of path's to follow for the proposals. Inits a centerline.
+        :param current_lane: current or starting lane of path-planning
+        :return: lists of paths (0-index is centerline)
+        """
+        centerline_discrete_path = self._get_discrete_centerline(current_lane)
+        self._centerline = PDMPath(centerline_discrete_path)
+
+        # 1. save centerline path (necessary for progress metric)
+        output_paths: List[PDMPath] = [self._centerline]
+
+        # 2. add additional paths with lateral offset of centerline
+        if self._lateral_offsets is not None:
+            for lateral_offset in self._lateral_offsets:
+                offset_discrete_path = parallel_discrete_path(
+                    discrete_path=centerline_discrete_path, offset=lateral_offset
+                )
+                output_paths.append(PDMPath(offset_discrete_path))
+
+        return output_paths
 
 
     def compute_planner_trajectory(self, current_input: PlannerInput) -> AbstractTrajectory:
@@ -948,6 +1038,33 @@ class DiffusionPlanner(AbstractPlanner):
         """
         self._current_input = current_input
         self._current_ego_state, self._current_observation_raw = current_input.history.current_state
+        if self._pdm_iteration == 0:
+            self._route_roadblock_correction(self._current_ego_state)
+
+        self._drivable_area_map = get_drivable_area_map(
+            self._map_api,
+            self._current_ego_state,
+            self._map_radius,
+            self._route_lane_dict,
+        )
+
+        if self._pdm_iteration % 5 == 0:
+            self._pdm_observation.update(
+                self._current_ego_state,
+                self._current_observation_raw,
+                current_input.traffic_light_data,
+                self._route_lane_dict,
+            )
+            self._update_proposal_manager(self._current_ego_state)
+
+            _ = self._pdm_generator.generate_proposals(
+                self._current_ego_state,
+                self._pdm_observation,
+                self._pdm_proposal_manager,
+            )
+            self._lead_agent = self._pdm_generator.get_lead_agent()
+
+        self._pdm_iteration += 1
 
         # RAW inputs from DataProcessor
         inputs_raw = self.planner_input_to_model_inputs(current_input)
