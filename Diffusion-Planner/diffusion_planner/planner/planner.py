@@ -37,6 +37,8 @@ from tuplan_garage.planning.simulation.planner.pdm_planner.utils.route_utils imp
 from tuplan_garage.planning.simulation.planner.pdm_planner.proposal.batch_idm_policy import BatchIDMPolicy
 from tuplan_garage.planning.simulation.planner.pdm_planner.proposal.pdm_generator import PDMGenerator
 from tuplan_garage.planning.simulation.planner.pdm_planner.proposal.pdm_proposal import PDMProposalManager
+from tuplan_garage.planning.simulation.planner.pdm_planner.utils.pdm_array_representation import ego_states_to_state_array
+from tuplan_garage.planning.simulation.planner.pdm_planner.utils.diffusion_utils import interpolate_trajectory, convert_to_global
 
 
 
@@ -353,6 +355,94 @@ class DiffusionPlanner(AbstractPlanner):
             f"non_parent0={self._sel_non_parent0_all}"
         )
 
+
+    def _branch_outputs_to_pdm_states(self, branch_outputs: Dict[str, torch.Tensor]) -> np.ndarray:
+        """
+        Convert one branch output into the closed-loop proposal format expected by the PDM simulator.
+        Returns a numpy array of shape [1, 81, 11].
+        """
+        pred = branch_outputs["prediction"]
+
+        if pred.ndim == 4:
+            # [B, P, T, 4] -> ego participant only
+            ego_pred = pred[0, 0].detach().cpu().numpy().astype(np.float64)   # [T, 4]
+        elif pred.ndim == 3:
+            # [P, T, 4] -> ego participant only
+            ego_pred = pred[0].detach().cpu().numpy().astype(np.float64)      # [T, 4]
+        else:
+            raise ValueError(f"Unexpected prediction shape: {tuple(pred.shape)}")
+
+        # Convert (x, y, cos, sin) -> (x, y, heading)
+        heading = np.arctan2(ego_pred[:, 3], ego_pred[:, 2])[..., None]
+        traj_local = np.concatenate([ego_pred[:, :2], heading], axis=-1)[None, ...]   # [1, T, 3]
+
+        # Prepend current pose at t=0, exactly like Diffusion-ES
+        traj_local = np.concatenate(
+            [np.zeros((traj_local.shape[0], 1, 3), dtype=np.float64), traj_local],
+            axis=1,
+        )  # [1, T+1, 3]
+
+        # Interpolate to dense horizon expected by the simulator / scorer
+        traj_interp = interpolate_trajectory(traj_local, 81)  # [1, 81, 3]
+
+        # Convert to global frame
+        traj_global = convert_to_global(self._current_ego_state, traj_interp)  # [1, 81, 3]
+
+        # Pad to simulator state width
+        traj_padded = np.concatenate(
+            [traj_global, np.zeros((traj_global.shape[0], traj_global.shape[1], 8), dtype=np.float64)],
+            axis=2,
+        )  # [1, 81, 11]
+
+        return traj_padded
+
+    def _score_branch_pdm(self, branch_outputs: Dict[str, torch.Tensor]) -> float:
+        """
+        Score one branch using the Diffusion-ES / modified PDM-Closed reward.
+        Lower returned value is better, so we negate the PDM score.
+        """
+        required = [
+            self._pdm_observation,
+            self._pdm_simulator,
+            self._pdm_scorer,
+            self._centerline,
+            self._drivable_area_map,
+            self._route_lane_dict,
+            self._current_input,
+            self._current_ego_state,
+        ]
+        if any(x is None for x in required):
+            raise RuntimeError("PDM scoring context is incomplete")
+
+        if self._speed_limit is None:
+            raise RuntimeError("PDM speed limit is not available")
+
+        proposal_states = self._branch_outputs_to_pdm_states(branch_outputs)
+
+        trajectory_sim = self._pdm_simulator.simulate_proposals(
+            proposal_states,
+            self._current_ego_state,
+        )
+
+        state_history = ego_states_to_state_array(self._current_input.history.ego_states)
+
+        scores = self._pdm_scorer.score_proposals(
+            trajectory_sim,
+            self._current_ego_state,
+            self._pdm_observation,
+            self._centerline,
+            self._route_lane_dict,
+            self._drivable_area_map,
+            self._map_api,
+            self._speed_limit,
+            self._lead_agent,
+            state_history,
+        )
+
+        # PDM score is higher-is-better. Tree selector expects lower-is-better.
+        return -float(scores[0])
+
+
             
     def score_branch_legacy(self, branch_traj: AbstractTrajectory, branch_outputs: Dict[str, torch.Tensor], branch_inputs: Dict[str, torch.Tensor] = None) -> float:
         """
@@ -604,8 +694,15 @@ class DiffusionPlanner(AbstractPlanner):
         return score
 
     def score_branch(self, branch_traj: AbstractTrajectory, branch_outputs: Dict[str, torch.Tensor], branch_inputs: Dict[str, torch.Tensor] = None) -> float:
-        return self.score_branch_legacy(branch_traj, branch_outputs, branch_inputs)
+        if not self._pdm_ready:
+            return self.score_branch_legacy(branch_traj, branch_outputs, branch_inputs)
 
+        try:
+            return self._score_branch_pdm(branch_outputs)
+        except Exception as e:
+            if self._debug_verbose:
+                print(f"[DEBUG][score_branch] PDM scoring failed, falling back to legacy: {e}")
+            return self.score_branch_legacy(branch_traj, branch_outputs, branch_inputs)
 
     def get_best_trajectory(self, trajectories: List["DiffusionPlanner.MidOutput"]) -> AbstractTrajectory:
         """
@@ -1038,16 +1135,16 @@ class DiffusionPlanner(AbstractPlanner):
         """
         self._current_input = current_input
         self._current_ego_state, self._current_observation_raw = current_input.history.current_state
+
+        #PDM utils
         if self._pdm_iteration == 0:
             self._route_roadblock_correction(self._current_ego_state)
-
         self._drivable_area_map = get_drivable_area_map(
             self._map_api,
             self._current_ego_state,
             self._map_radius,
             self._route_lane_dict,
         )
-
         if self._pdm_iteration % 5 == 0:
             self._pdm_observation.update(
                 self._current_ego_state,
@@ -1063,8 +1160,18 @@ class DiffusionPlanner(AbstractPlanner):
                 self._pdm_proposal_manager,
             )
             self._lead_agent = self._pdm_generator.get_lead_agent()
-
         self._pdm_iteration += 1
+        self._pdm_ready = (
+            self._pdm_observation is not None
+            and self._pdm_simulator is not None
+            and self._pdm_scorer is not None
+            and self._centerline is not None
+            and self._drivable_area_map is not None
+            and self._route_lane_dict is not None
+            and self._current_input is not None
+            and self._current_ego_state is not None
+            and self._speed_limit is not None
+        )
 
         # RAW inputs from DataProcessor
         inputs_raw = self.planner_input_to_model_inputs(current_input)
