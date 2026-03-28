@@ -103,7 +103,7 @@ class DiffusionPlanner(AbstractPlanner):
         self._sel_print_every = 149   # 0 disables periodic stats printing
         self._debug_verbose = True
 
-        self._margin = 10.0          # parent0 override margin (lower score is better)
+        self._margin = 0.005          # parent0 override margin (lower score is better)
         self._model_loaded = False  # avoid re-loading checkpoint every scenario
 
         # Lightweight batch sanity checks (only once per batch size)
