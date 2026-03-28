@@ -159,6 +159,8 @@ class DiffusionPlanner(AbstractPlanner):
         self._current_observation_raw = None
 
         self._pdm_iteration = 0
+        self._pdm_fallback_count = 0
+        self._pdm_not_ready_count = 0
         self._map_radius = 50.0
         self._route_roadblock_dict = None
         self._route_lane_dict = None
@@ -232,6 +234,9 @@ class DiffusionPlanner(AbstractPlanner):
         self._current_ego_state = None
         self._current_observation_raw = None
         self._pdm_iteration = 0
+        self._scenario_tick = 0
+        self._pdm_fallback_count = 0
+        self._pdm_not_ready_count = 0
         self._pdm_generator = None
         self._pdm_proposal_manager = None
         self._pdm_observation = PDMObservation(
@@ -695,14 +700,20 @@ class DiffusionPlanner(AbstractPlanner):
 
     def score_branch(self, branch_traj: AbstractTrajectory, branch_outputs: Dict[str, torch.Tensor], branch_inputs: Dict[str, torch.Tensor] = None) -> float:
         if not self._pdm_ready:
+            self._pdm_not_ready_count += 1
+            print(f"[WARN][PDM] NOT_READY -> legacy fallback (count={self._pdm_not_ready_count})")
             return self.score_branch_legacy(branch_traj, branch_outputs, branch_inputs)
 
         try:
             return self._score_branch_pdm(branch_outputs)
-        except Exception as e:
-            if self._debug_verbose:
-                print(f"[DEBUG][score_branch] PDM scoring failed, falling back to legacy: {e}")
+        except Exception:
+            import traceback
+            self._pdm_fallback_count += 1
+            print(f"[WARN][PDM] EXCEPTION -> legacy fallback (count={self._pdm_fallback_count})")
+            traceback.print_exc()
             return self.score_branch_legacy(branch_traj, branch_outputs, branch_inputs)
+
+
 
     def get_best_trajectory(self, trajectories: List["DiffusionPlanner.MidOutput"]) -> AbstractTrajectory:
         """
@@ -1093,12 +1104,21 @@ class DiffusionPlanner(AbstractPlanner):
 
         self._pdm_proposal_manager.update(self._current_lane.speed_limit_mps)
 
+        speed_limit = None
+
         if isinstance(self._current_lane, NuPlanLane):
-            self._speed_limit = self._current_lane.speed_limit_mps
+            speed_limit = self._current_lane.speed_limit_mps
         else:
             edges = self._current_lane.incoming_edges + self._current_lane.outgoing_edges + [self._current_lane]
             speed_limits = [edge.speed_limit_mps for edge in edges if edge.speed_limit_mps is not None]
-            self._speed_limit = max(speed_limits) if len(speed_limits) > 0 else 100
+            if len(speed_limits) > 0:
+                speed_limit = max(speed_limits)
+
+        if speed_limit is None:
+            if self._speed_limit is None:
+                self._speed_limit = 100.0
+        else:
+            self._speed_limit = float(speed_limit)
 
 
     def _get_proposal_paths(
@@ -1135,6 +1155,7 @@ class DiffusionPlanner(AbstractPlanner):
         """
         self._current_input = current_input
         self._current_ego_state, self._current_observation_raw = current_input.history.current_state
+        self._scenario_tick += 1
 
         #PDM utils
         if self._pdm_iteration == 0:
@@ -1161,17 +1182,21 @@ class DiffusionPlanner(AbstractPlanner):
             )
             self._lead_agent = self._pdm_generator.get_lead_agent()
         self._pdm_iteration += 1
-        self._pdm_ready = (
-            self._pdm_observation is not None
-            and self._pdm_simulator is not None
-            and self._pdm_scorer is not None
-            and self._centerline is not None
-            and self._drivable_area_map is not None
-            and self._route_lane_dict is not None
-            and self._current_input is not None
-            and self._current_ego_state is not None
-            and self._speed_limit is not None
-        )
+        required_pdm = {
+            "_pdm_observation": self._pdm_observation,
+            "_pdm_simulator": self._pdm_simulator,
+            "_pdm_scorer": self._pdm_scorer,
+            "_centerline": self._centerline,
+            "_drivable_area_map": self._drivable_area_map,
+            "_route_lane_dict": self._route_lane_dict,
+            "_current_input": self._current_input,
+            "_current_ego_state": self._current_ego_state,
+            "_speed_limit": self._speed_limit,
+        }
+        missing = [name for name, value in required_pdm.items() if value is None]
+        self._pdm_ready = len(missing) == 0
+        if self._debug_verbose and missing:
+            print(f"[DEBUG][pdm_ready] missing={missing}")
 
         # RAW inputs from DataProcessor
         inputs_raw = self.planner_input_to_model_inputs(current_input)
@@ -1257,6 +1282,13 @@ class DiffusionPlanner(AbstractPlanner):
                 trajectory=self.outputs_to_trajectory(branch_outputs, current_input.history.ego_states)
             )
             all_traj[parent_idx].add_branch(branch_traj, branch_outputs, branch_inputs)
+
+        if self._debug_verbose and (self._scenario_tick % 149 == 0):
+            print(
+                f"[INFO][PDM] tick={self._scenario_tick} "
+                f"fallback_count={self._pdm_fallback_count} "
+                f"not_ready_count={self._pdm_not_ready_count}"
+            )
 
         # Choose parent based on best leaf (branch)
         return self.get_best_trajectory(all_traj)
