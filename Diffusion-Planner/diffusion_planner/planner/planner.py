@@ -126,6 +126,8 @@ class DiffusionPlanner(AbstractPlanner):
         # True  -> use pred t=0 (the “one-tick” alternative you tested)
         self._roll_use_pred_t0 = False
 
+        self._use_pdm_scorer = True
+
         # PDM / Diffusion-ES reward scaffold
         self._pdm_ready = False
         self._pdm_observation = None
@@ -699,7 +701,7 @@ class DiffusionPlanner(AbstractPlanner):
         return score
 
     def score_branch(self, branch_traj: AbstractTrajectory, branch_outputs: Dict[str, torch.Tensor], branch_inputs: Dict[str, torch.Tensor] = None) -> float:
-        if not self._pdm_ready:
+        if self._use_pdm_scorer and (not self._pdm_ready ) :
             self._pdm_not_ready_count += 1
             print(f"[WARN][PDM] NOT_READY -> legacy fallback (count={self._pdm_not_ready_count})")
             return self.score_branch_legacy(branch_traj, branch_outputs, branch_inputs)
