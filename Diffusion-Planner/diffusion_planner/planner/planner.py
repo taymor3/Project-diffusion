@@ -701,19 +701,25 @@ class DiffusionPlanner(AbstractPlanner):
         return score
 
     def score_branch(self, branch_traj: AbstractTrajectory, branch_outputs: Dict[str, torch.Tensor], branch_inputs: Dict[str, torch.Tensor] = None) -> float:
-        if self._use_pdm_scorer and (not self._pdm_ready ) :
-            self._pdm_not_ready_count += 1
-            print(f"[WARN][PDM] NOT_READY -> legacy fallback (count={self._pdm_not_ready_count})")
-            return self.score_branch_legacy(branch_traj, branch_outputs, branch_inputs)
+        legacy_score = self.score_branch_legacy(branch_traj, branch_outputs, branch_inputs)
 
-        try:
-            return self._score_branch_pdm(branch_outputs)
-        except Exception:
-            import traceback
-            self._pdm_fallback_count += 1
-            print(f"[WARN][PDM] EXCEPTION -> legacy fallback (count={self._pdm_fallback_count})")
-            traceback.print_exc()
-            return self.score_branch_legacy(branch_traj, branch_outputs, branch_inputs)
+        pdm_score = float("inf")
+        if not self._pdm_ready:
+            self._pdm_not_ready_count += 1
+            print(f"[WARN][PDM] NOT_READY -> pdm_score=inf (count={self._pdm_not_ready_count})")
+        else:
+            try:
+                pdm_score = self._score_branch_pdm(branch_outputs)
+            except Exception:
+                import traceback
+                self._pdm_fallback_count += 1
+                print(f"[WARN][PDM] EXCEPTION -> pdm_score=inf (count={self._pdm_fallback_count})")
+                traceback.print_exc()
+
+        if self._debug_verbose:
+            print(f"[DEBUG][score_branch] legacy_score={legacy_score:.2f} pdm_score={pdm_score:.2f}")
+
+        return pdm_score if self._use_pdm_scorer else legacy_score
 
 
 
@@ -734,8 +740,10 @@ class DiffusionPlanner(AbstractPlanner):
 
                 # Track best score for parent 0 separately
                 if parent_idx == 0:
+                    print(f"[DEBUG][get_best_trajectory] parent 0 branch score: {score:.4f}")
                     if parent0_best_score is None or score < parent0_best_score:
                         parent0_best_score = score
+
 
                 # Track global best over all parents
                 if global_best_score is None or score < global_best_score:
@@ -763,6 +771,13 @@ class DiffusionPlanner(AbstractPlanner):
         # periodic logging
         if self._sel_print_every and (self._sel_total % self._sel_print_every == 0):
             self._sel_log("running")
+
+        if self._debug_verbose:
+            print(
+                f"[DEBUG][get_best_trajectory] global_best_score={global_best_score:.4f} "
+                f"parent0_best_score={parent0_best_score:.4f} "
+                f"selected_non_parent0={selected_non_parent0}"
+            )
 
         if selected_non_parent0:
             if self._debug_verbose:
