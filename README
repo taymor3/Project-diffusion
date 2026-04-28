@@ -1,9 +1,312 @@
-copy all of the repo into your local vm.
-download all the environment package in the nuplan devkit.
-download minisplit and maps from nuplan database
-store them in the bashrc
-export NUPLAN_DATA_ROOT=$HOME/data1/nuplan-v1.1/splits/mini
-export NUPLAN_MAPS_ROOT=$HOME/data1/maps
-after that update the o1_toy_data.ipynb
-to make the places of the database right
-after that run the cell in the jupyter you should see the whole senarios of the database.
+# Tree-Based Diffusion Planning in Closed-Loop Autonomous Driving
+
+This repository contains a research project built on top of **Diffusion-Planner** and **nuPlan**, with the goal of improving closed-loop trajectory planning through **tree-based candidate search**, **batched inference**, and later **PDM-based scoring**.
+
+The project starts from a pretrained diffusion planner baseline and adds a structured planning layer that generates multiple candidate trajectories per tick, compares them, and decides whether to keep the baseline-like candidate or switch to an alternative.
+
+---
+
+## Overview
+
+The baseline planner generates a single sampled ego trajectory at each simulation tick and executes it directly. This project extends that setup with:
+
+* parent candidate generation
+* branch continuation generation
+* margin-gated parent selection
+* batched parent / branch inference
+* legacy heuristic scoring
+* PDM / Diffusion-ES-inspired scoring
+* closed-loop evaluation in nuPlan
+
+The strongest confirmed result in the project came from the **v1.2 tree line**, which improved the 100-scenario score over the baseline. The later **v1.4 phase** introduced PDM-based scoring and fixed several important implementation issues, but also exposed a central architectural mismatch: **branches are scored, but parents are executed**. That freeze point is treated as a diagnostic stage rather than a final architecture.
+
+---
+
+## Main Idea
+
+The planner keeps a **baseline-like Parent 0** and generates additional exploratory parents by injecting controlled noise into selected normalized input tensors. For each parent, the planner also generates short branch continuations and uses those branches to estimate whether the parent is promising.
+
+The decision rule is conservative:
+
+* Parent 0 is the default
+* Another parent is selected only if its score is clearly better than Parent 0 by more than a margin
+
+This makes the tree behave as a **rare-override mechanism** rather than a planner that constantly abandons the baseline.
+
+---
+
+## Current Status
+
+Current state of the project:
+
+* baseline parent path can reproduce the original `v0` behavior under large-margin control
+* batched inference is implemented and usable
+* PDM scoring components are integrated and runnable
+* parent / branch generation is active
+* the main remaining issue is architectural: the scored candidate and the executed candidate do not fully match
+
+The clean next experiment is **parent-only PDM selection**, where the planner scores and executes the same parent candidate.
+
+---
+
+## Repository Structure
+
+Key files:
+
+* `planner.py` — current active planner implementation
+* `plannerv0.py` — original baseline planner wrapper
+* `planner_tmp_3.5min.py` — known fast batched reference
+* `checkpoints/model.pth` — pretrained Diffusion-Planner checkpoint
+* `checkpoints/args.json` — model/config arguments
+
+The notebook workflow also includes utilities for:
+
+* scenario discovery
+* scenario validity checking
+* benchmark execution
+* nuBoard visualization
+
+---
+
+## Planner Logic Summary
+
+At a high level, the planner does the following:
+
+1. convert the current nuPlan input into model tensors
+2. normalize observation tensors
+3. generate a clean Parent 0
+4. generate additional exploratory parents
+5. optionally roll neighbor history for branch generation
+6. generate branch candidates
+7. score the candidates
+8. apply margin-gated parent selection
+9. return the chosen parent trajectory to nuPlan
+
+The most important current caveat is that **branches are used for scoring, but the executed output is still a parent trajectory**. That is the main remaining architectural concern in the current code line.
+
+---
+
+## Environment
+
+Expected environment:
+
+* Python 3.9
+* PyTorch
+* Jupyter Notebook
+* nuPlan devkit
+* Diffusion-Planner
+* `tuplan_garage` / Diffusion-ES-related planner components
+* Hydra
+
+Early development was done locally in **WSL2 Ubuntu**. Larger experiments were later moved to a **remote lab machine over SSH** with a stronger GPU.
+
+---
+
+## Required Codebases
+
+The notebook workflow expects access to three codebases:
+
+* `nuplan-devkit`
+* `Diffusion-Planner`
+* `diffusion-es/tuplan_garage`
+
+These are inserted manually into `sys.path` during runs. The project does not assume a fully packaged install flow.
+
+---
+
+## Typical Workflow
+
+The project is primarily run from **Jupyter notebooks** rather than a pure CLI workflow.
+
+Standard flow:
+
+1. patch the Jupyter event loop with `nest_asyncio`
+2. insert required repositories into `sys.path`
+3. prepare Hydra overrides
+4. set `sys.argv`
+5. call the nuPlan simulation entrypoint
+6. inspect results in `nuBoard`
+
+This notebook-first workflow made it easier to iterate quickly on planner code, scenario filters, and debugging utilities.
+
+---
+
+## Running a Simulation
+
+Main simulation entrypoint:
+
+```python
+from nuplan.planning.script.run_simulation import main as run_simulation_main
+```
+
+The run is controlled through Hydra overrides passed via `sys.argv`.
+
+Common override fields:
+
+* `experiment_name=...`
+* `scenario_builder=nuplan_mini`
+* `scenario_builder.data_root=...`
+* `scenario_builder.map_root=...`
+* `+simulation=closed_loop_nonreactive_agents`
+* `planner=diffusion_planner`
+* `planner.diffusion_planner.config.args_file=.../checkpoints/args.json`
+* `planner.diffusion_planner.ckpt_path=.../checkpoints/model.pth`
+* `scenario_filter=...`
+* `worker=sequential`
+* `verbose=true`
+* `hydra.searchpath=[...]`
+
+Example notebook-side pattern:
+
+```python
+import os
+import sys
+import nest_asyncio
+
+nest_asyncio.apply()
+os.environ["HYDRA_FULL_ERROR"] = "1"
+
+from nuplan.planning.script.run_simulation import main as run_simulation_main
+
+original_argv = list(sys.argv)
+sys.argv = [
+    "nuplan-devkit/nuplan/planning/script/run_simulation.py",
+    "experiment_name=my_experiment",
+    "scenario_builder=nuplan_mini",
+    "scenario_builder.data_root=/path/to/data",
+    "scenario_builder.map_root=/path/to/maps",
+    "+simulation=closed_loop_nonreactive_agents",
+    "planner=diffusion_planner",
+    "planner.diffusion_planner.config.args_file=/path/to/checkpoints/args.json",
+    "planner.diffusion_planner.ckpt_path=/path/to/checkpoints/model.pth",
+    "scenario_filter=test14-hard",
+    "worker=sequential",
+    "verbose=true",
+    "hydra.searchpath=[pkg://diffusion_planner.config.scenario_filter,pkg://diffusion_planner.config,pkg://nuplan.planning.script.config.common,pkg://nuplan.planning.script.experiments]",
+]
+
+run_simulation_main()
+sys.argv = original_argv
+```
+
+---
+
+## Benchmark Modes Used
+
+Main benchmark filters used during the project:
+
+* `val14`
+* `test14-hard`
+* `test14-random`
+* `val14-collision`
+
+The project also used smaller development suites for fast regression checks before running broader closed-loop evaluation.
+
+---
+
+## Scenario Discovery and Token Validation
+
+The notebook workflow includes utilities for:
+
+* discovering candidate scenarios
+* validating scenario tokens
+* running either official benchmark filters or manually chosen tokens
+
+Key practical points:
+
+* scenario discovery uses `NuPlanScenarioBuilder`, `ScenarioFilter`, and `SingleMachineParallelExecutor`
+* manual token mode is useful for debugging but more fragile
+* scenario tokens must be quoted as strings when passed through Hydra
+* official filter runs are preferred for broader evaluation
+
+Safe Hydra token format:
+
+```text
+scenario_filter.scenario_tokens=["token1", "token2"]
+```
+
+---
+
+## nuBoard Visualization
+
+Main nuBoard entrypoint:
+
+```python
+from nuplan.planning.script.run_nuboard import main as run_nuboard_main
+```
+
+nuBoard was used as part of the debugging workflow, not only as a final visualization tool. It is useful for checking:
+
+* whether the intended scenarios actually ran
+* whether the ego trajectory looks physically reasonable
+* whether a score improvement also looks like a real behavioral improvement in closed-loop playback
+
+---
+
+## What Was Fixed
+
+Several important implementation issues were fixed during the project:
+
+* Parent 0 exact baseline parity
+* RNG restoration after exploratory sampling
+* speed-limit fallback issues
+* proposal / centerline refresh after lane changes
+* PDM fallback accounting
+* batching structure for practical runtime
+
+These fixes matter because they reduce false explanations for performance changes and make later architectural evaluation more trustworthy.
+
+---
+
+## Known Limitations
+
+Current limitations include:
+
+* branch-based selection still has a score-execute mismatch
+* rolled branch world is only partially coherent
+* PDM integration is usable, but not yet proven as the final scoring architecture
+* the clean parent-only PDM experiment is still the key next discriminator
+
+---
+
+## Suggested Next Steps
+
+Most meaningful next steps:
+
+1. implement **parent-only PDM selection**
+2. verify large-margin parent-only parity with `v0`
+3. run a clean parent-only margin sweep
+4. test PDM context refresh frequency explicitly
+5. test model-native diversity controls such as temperature
+6. investigate deeper tree consistency, including ego-state rolling
+7. extend evaluation to broader official filters and mid-size scenario batches
+
+---
+
+## Reproducibility Notes
+
+This repository is not a plug-and-play benchmark package. It assumes:
+
+* existing access to nuPlan data and maps
+* working checkpoints
+* a configured notebook environment
+* correct repository path setup
+* familiarity with Hydra override-based execution
+
+This is a research project repository intended for continued development and controlled experiments.
+
+---
+
+## Acknowledgment
+
+This project builds on:
+
+* the nuPlan devkit and evaluation framework
+* the Diffusion-Planner baseline
+* PDM / Diffusion-ES-related planning components
+* the conceptual direction of diffusion-based structured candidate search
+
+Special Thanks to the CRML Lab staff at Technion for providing the fertile environment for developing this project and other great projects.
+
+```
+```

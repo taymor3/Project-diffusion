@@ -100,20 +100,20 @@ class DiffusionPlanner(AbstractPlanner):
         self._sel_parent0_all = 0
         self._sel_non_parent0_all = 0
 
-        self._sel_print_every = 149   # 0 disables periodic stats printing
+        self._sel_print_every = 149     # 0 disables periodic stats printing
         self._debug_verbose = True
 
-        self._margin = 0.005          # parent0 override margin (lower score is better)
-        self._model_loaded = False  # avoid re-loading checkpoint every scenario
+        self._margin = 0.03             # parent0 override margin (lower score is better)
+        self._model_loaded = False      # avoid re-loading checkpoint every scenario
 
         # Lightweight batch sanity checks (only once per batch size)
         self._checked_batch_sanity = set()
         self._batch_sanity_keys = ("ego_agent_past", "neighbor_agents_past")
 
         # ---------------- GPU memory logging (OFF by default) ----------------
-        self._mem_log = False          # set True to enable prints
-        self._mem_every = 49           # print every N ticks within a scenario
-        self._scenario_tick = 0        # reset in initialize()
+        self._mem_log = False           # set True to enable prints
+        self._mem_every = 49            # print every N ticks within a scenario
+        self._scenario_tick = 0         # reset in initialize()
 
         # scenario-level baseline + peaks (MB)
         self._mem_start_alloc_mb = 0.0
@@ -164,6 +164,7 @@ class DiffusionPlanner(AbstractPlanner):
         self._map_radius = 50.0
         self._route_roadblock_dict = None
         self._route_lane_dict = None
+        self._proposal_lane_id = None
 
         self._pdm_scorer_config = {
             "weighted_metrics": {
@@ -239,6 +240,7 @@ class DiffusionPlanner(AbstractPlanner):
         self._pdm_not_ready_count = 0
         self._pdm_generator = None
         self._pdm_proposal_manager = None
+        self._proposal_lane_id = None
         self._pdm_observation = PDMObservation(
             self._pdm_trajectory_sampling,
             self._pdm_trajectory_sampling,
@@ -359,6 +361,17 @@ class DiffusionPlanner(AbstractPlanner):
             f"ALL ticks={self._sel_total_all} parent0={self._sel_parent0_all} "
             f"non_parent0={self._sel_non_parent0_all}"
         )
+
+    def _capture_rng_state(self) -> Dict[str, object]:
+        state: Dict[str, object] = {"cpu": torch.get_rng_state()}
+        if self._device == "cuda":
+            state["cuda"] = torch.cuda.get_rng_state_all()
+        return state
+
+    def _restore_rng_state(self, state: Dict[str, object]) -> None:
+        torch.set_rng_state(state["cpu"])
+        if self._device == "cuda" and "cuda" in state:
+            torch.cuda.set_rng_state_all(state["cuda"])
 
 
     def _branch_outputs_to_pdm_states(self, branch_outputs: Dict[str, torch.Tensor]) -> np.ndarray:
@@ -1092,7 +1105,12 @@ class DiffusionPlanner(AbstractPlanner):
 
         self._current_lane = self._get_starting_lane(ego_state)
 
-        create_new_proposals = self._pdm_iteration == 0
+        create_new_proposals = (
+            self._pdm_proposal_manager is None
+            or self._centerline is None
+            or self._proposal_lane_id is None
+            or self._proposal_lane_id != self._current_lane.id
+        )
 
         if create_new_proposals:
             proposal_paths: List[PDMPath] = self._get_proposal_paths(self._current_lane)
@@ -1101,6 +1119,7 @@ class DiffusionPlanner(AbstractPlanner):
                 lateral_proposals=proposal_paths,
                 longitudinal_policies=self._idm_policies,
             )
+            self._proposal_lane_id = self._current_lane.id
 
         self._pdm_proposal_manager.update(self._current_lane.speed_limit_mps)
 
@@ -1166,21 +1185,20 @@ class DiffusionPlanner(AbstractPlanner):
             self._map_radius,
             self._route_lane_dict,
         )
-        if self._pdm_iteration % 5 == 0:
-            self._pdm_observation.update(
-                self._current_ego_state,
-                self._current_observation_raw,
-                current_input.traffic_light_data,
-                self._route_lane_dict,
-            )
-            self._update_proposal_manager(self._current_ego_state)
+        self._pdm_observation.update(
+            self._current_ego_state,
+            self._current_observation_raw,
+            current_input.traffic_light_data,
+            self._route_lane_dict,
+        )
+        self._update_proposal_manager(self._current_ego_state)
 
-            _ = self._pdm_generator.generate_proposals(
-                self._current_ego_state,
-                self._pdm_observation,
-                self._pdm_proposal_manager,
-            )
-            self._lead_agent = self._pdm_generator.get_lead_agent()
+        _ = self._pdm_generator.generate_proposals(
+            self._current_ego_state,
+            self._pdm_observation,
+            self._pdm_proposal_manager,
+        )
+        self._lead_agent = self._pdm_generator.get_lead_agent()
         self._pdm_iteration += 1
         required_pdm = {
             "_pdm_observation": self._pdm_observation,
@@ -1228,7 +1246,7 @@ class DiffusionPlanner(AbstractPlanner):
 
 
         # Tree shape
-        num_of_parents = 4
+        num_of_parents = 8
         num_of_branches = 2
 
         # Noise levels
@@ -1237,13 +1255,23 @@ class DiffusionPlanner(AbstractPlanner):
 
         all_traj: List[DiffusionPlanner.MidOutput] = []
 
-        parent_inputs_list: List[Dict[str, torch.Tensor]] = []
-        for parent_idx in range(num_of_parents):
-            cur_parent_noise = 0.0 if parent_idx == 0 else parent_noise_std
-            parent_inputs_list.append(self._add_noise_to_inputs(norm_inputs, std=cur_parent_noise))
+        # Parent 0 must use the exact v0 path
+        with torch.no_grad():
+            _, parent0_outputs = self._planner(norm_inputs)
 
-        # One model call for all parents (batch size = num_of_parents)
-        parent_outputs_list = self._planner_forward_batched(parent_inputs_list)
+        parent_outputs_list: List[Dict[str, torch.Tensor]] = [parent0_outputs]
+
+        # Preserve the RNG state that v0 would leave behind after its single forward pass.
+        rng_state_after_parent0 = self._capture_rng_state()
+
+        # Exploratory parents are still batched
+        if num_of_parents > 1:
+            exploration_inputs: List[Dict[str, torch.Tensor]] = []
+            for _ in range(num_of_parents - 1):
+                exploration_inputs.append(self._add_noise_to_inputs(norm_inputs, std=parent_noise_std))
+
+            exploration_outputs = self._planner_forward_batched(exploration_inputs)
+            parent_outputs_list.extend(exploration_outputs)
 
         # Build ALL branches for ALL parents first, then run ONE batched branch call (bs = num_of_parents * num_of_branches)
         branch_inputs_all: List[Dict[str, torch.Tensor]] = []
@@ -1289,6 +1317,9 @@ class DiffusionPlanner(AbstractPlanner):
                 f"fallback_count={self._pdm_fallback_count} "
                 f"not_ready_count={self._pdm_not_ready_count}"
             )
+
+        # Restore RNG so the next tick's parent0 starts from the same RNG state as v0.
+        self._restore_rng_state(rng_state_after_parent0)
 
         # Choose parent based on best leaf (branch)
         return self.get_best_trajectory(all_traj)
